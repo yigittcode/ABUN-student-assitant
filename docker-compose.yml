@@ -1,0 +1,15 @@
+---
+version: '3.4'
+services:
+  weaviate:
+    image: semitechnologies/weaviate:1.25.4 # Stabil bir Weaviate versiyonu
+    ports:
+      - "8009:8080"  # YENİ/DEĞİŞTİ # HTTP portu dışarıya 8009 olarak açıldı
+      - "50051:50051" # gRPC portu
+    volumes:
+      - ./weaviate_data:/var/lib/weaviate # Veritabanı verilerini kalıcı olarak saklamak için
+    environment:
+      AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: 'true'
+      PERSISTENCE_DATA_PATH: '/var/lib/weaviate'
+      DEFAULT_VECTORIZER_MODULE: 'none' # Vektörleri Python'da kendimiz oluşturacağız
+      CLUSTER_HOSTNAME: 'node1'
