@@ -42,6 +42,14 @@ class SpeechProcessor:
             "ahmet": "tr-TR-AhmetNeural",    # Erkek ses
         }
         
+        # Basit gender mapping
+        self.gender_voices = {
+            "female": "tr-TR-EmelNeural",    # Varsayılan kadın ses
+            "male": "tr-TR-AhmetNeural",     # Erkek ses seçeneği
+            "kadın": "tr-TR-EmelNeural",     # Türkçe alias
+            "erkek": "tr-TR-AhmetNeural"     # Türkçe alias
+        }
+        
         # TTS optimizasyon sözlüğü
         self.text_optimizations = {
             'Dr.': 'Doktor',
@@ -199,6 +207,42 @@ class SpeechProcessor:
                 pass
         self.temp_files.clear()
     
+    def get_voice_by_gender(self, gender: str) -> str:
+        """
+        Gender parametresinden voice name döndür
+        
+        Args:
+            gender: "male", "female", "erkek", "kadın" veya direkt voice name
+            
+        Returns:
+            Voice name (tr-TR-EmelNeural formatında)
+        """
+        gender_lower = gender.lower().strip()
+        
+        # Önce gender mapping'e bak
+        if gender_lower in self.gender_voices:
+            return self.gender_voices[gender_lower]
+        
+        # Sonra voice name mapping'e bak
+        if gender_lower in self.turkish_voices:
+            return self.turkish_voices[gender_lower]
+        
+        # Direkt voice name mi? (tr-TR-... formatında)
+        if gender.startswith("tr-TR-"):
+            return gender
+        
+        # Hiçbiri değilse varsayılan kadın ses
+        return "tr-TR-EmelNeural"
+    
     def get_available_voices(self) -> Dict[str, str]:
         """Mevcut Türkçe sesleri döndür"""
-        return self.turkish_voices.copy() 
+        return self.turkish_voices.copy()
+    
+    def get_gender_options(self) -> Dict[str, str]:
+        """Basit gender seçenekleri döndür"""
+        return {
+            "female": "Kadın ses (Emel - varsayılan)",
+            "male": "Erkek ses (Ahmet)",
+            "kadın": "Kadın ses (Emel)",
+            "erkek": "Erkek ses (Ahmet)"
+        } 

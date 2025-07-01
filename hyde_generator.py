@@ -115,7 +115,11 @@ async def generate_enhanced_hyde(question, client, domain_context=""):
         return api_cache[hyde_cache_key]
     
     # OPTIMIZATION 2: Smart category detection - skip complex analysis for simple questions
-    simple_patterns = ['nedir', 'what is', 'kimdir', 'neler']
+    simple_patterns = [
+        'nedir', 'what is', 'kimdir', 'neler', 'nasıl', 'how to',
+        'kaç', 'how many', 'var mı', 'is there', 'bulunur mu',
+        'hangi', 'which', 'ne zaman', 'when', 'nerede', 'where'
+    ]
     is_simple = any(pattern in question.lower() for pattern in simple_patterns)
     
     if is_simple and len(question.split()) <= 5:

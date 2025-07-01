@@ -1,7 +1,10 @@
+import asyncio
+import uuid
+from typing import List, Dict, Any, Optional
+from config import LLM_MODEL, HYDE_LLM_MODEL
 import numpy as np
 from hyde_generator import generate_hypothetical_answers, generate_multiple_hyde_variants
-from config import MAX_CONTEXT_TOKENS, LLM_MODEL, PROMPT_TEMPLATE, VOICE_PROMPT_TEMPLATE
-import asyncio
+from config import MAX_CONTEXT_TOKENS, PROMPT_TEMPLATE, VOICE_PROMPT_TEMPLATE
 from cachetools import TTLCache
 import json
 
@@ -310,17 +313,15 @@ async def _perform_hybrid_search(question, query_vector, collection, cross_encod
 
     combined_results = _combine_search_results(semantic_results, keyword_results)
     
-    # Smart cross-encoder: sadece belirsizlik varsa kullan
+    # Smart cross-encoder - OPTIMIZED threshold
     if cross_encoder_model and combined_results:
-        # Top 3 sonucun score'larını kontrol et
         top_scores = [r['score'] for r in combined_results[:3]]
         score_variance = max(top_scores) - min(top_scores) if len(top_scores) > 1 else 1.0
         
-        # Eğer top sonuçlar çok yakın skorlıysa (belirsizlik var), cross-encoder kullan
-        if score_variance < 0.15 and len(combined_results) > 3:
+        # More aggressive skipping for speed - increased threshold
+        if score_variance < 0.20 and len(combined_results) > 3:  # Increased from 0.15 to 0.20
             print("🎯 Smart reranking: High uncertainty detected, applying cross-encoder...")
-            reranked_results = await _cross_encoder_rerank(question, combined_results[:10], cross_encoder_model)
-            final_results = reranked_results[:10]
+            final_results = await _cross_encoder_rerank(question, combined_results[:10], cross_encoder_model)
         else:
             print("🚀 Smart reranking: Clear results, skipping cross-encoder for speed")
             final_results = combined_results[:10]
@@ -343,25 +344,59 @@ def _detect_db_type(collection):
 
 
 async def _weaviate_semantic_search(query_vector, collection):
-    """Weaviate için semantic search"""
-    # This is a synchronous call, but we run it in the gather
+    """Weaviate-specific semantic search with proper vector handling"""
     try:
+        # Ensure query_vector is properly formatted for Weaviate
+        if query_vector is None:
+            print("⚠️ No query vector provided, returning empty results")
+            return {"documents": [[]], "metadatas": [[]], "ids": [[]], "distances": [[]]}
+        
+        # Convert to proper format - Weaviate expects a single vector, not nested
+        if isinstance(query_vector, list):
+            search_vector = query_vector
+        elif isinstance(query_vector, np.ndarray):
+            if query_vector.ndim > 1:
+                # Flatten if multi-dimensional
+                search_vector = query_vector.flatten().tolist()
+            else:
+                search_vector = query_vector.tolist()
+        else:
+            print(f"⚠️ Unexpected query_vector type: {type(query_vector)}")
+            return {"documents": [[]], "metadatas": [[]], "ids": [[]], "distances": [[]]}
+        
+        print(f"🔍 Weaviate search with vector shape: {len(search_vector)}")
+        
         response = collection.query.near_vector(
-            near_vector=query_vector.tolist(),
-            limit=15,  # Reduced from 20 for faster queries
+            near_vector=search_vector,  # Single vector, not nested
+            limit=15,
             return_metadata=['distance']
         )
         
-        documents, metadatas, distances = [], [], []
+        documents = []
+        metadatas = []
+        ids = []
+        distances = []
+        
         for obj in response.objects:
             documents.append(obj.properties.get('content', ''))
-            metadatas.append({'source': obj.properties.get('source', ''), 'article': obj.properties.get('article', '')})
-            distances.append(obj.metadata.distance if obj.metadata.distance else 0.5)
+            metadatas.append({
+                'source': obj.properties.get('source', 'Unknown'),
+                'article': obj.properties.get('article', 'Unknown'),
+                'document_id': obj.properties.get('document_id', 'Unknown')
+            })
+            ids.append(str(obj.uuid))
+            distances.append(obj.metadata.distance if obj.metadata and hasattr(obj.metadata, 'distance') else 0.0)
         
-        return {'documents': [documents], 'metadatas': [metadatas], 'distances': [distances]}
+        return {
+            "documents": [documents],  # Wrapped in list for consistency
+            "metadatas": [metadatas],
+            "ids": [ids],
+            "distances": [distances]
+        }
+        
     except Exception as e:
         print(f"⚠️ Weaviate semantic search error: {e}")
-        return {'documents': [[]], 'metadatas': [[]], 'distances': [[]]}
+        return {"documents": [[]], "metadatas": [[]], "ids": [[]], "distances": [[]]}
 
 
 async def _chroma_semantic_search(query_vector, collection):
@@ -661,16 +696,16 @@ async def create_optimized_embeddings_v2(documents, model):
     if uncached_docs:
         print(f"🔥 Ultra-parallel processing {len(uncached_docs)} uncached documents...")
         
-        # Dynamic batch sizing based on available memory and GPU
+        # Dynamic batch sizing based on available memory and GPU - ULTRA PERFORMANCE
         total_docs = len(uncached_docs)
         if total_docs > 1000:
-            batch_size = 300  # Büyük dataset için max efficiency
+            batch_size = 400  # INCREASED: Büyük dataset için max efficiency
         elif total_docs > 500:
-            batch_size = 200
+            batch_size = 300  # INCREASED
         elif total_docs > 100:
-            batch_size = 150
+            batch_size = 200  # INCREASED
         else:
-            batch_size = 64
+            batch_size = 128  # INCREASED from 64
         
         print(f"📦 Using ultra-batch size: {batch_size}")
         
@@ -684,7 +719,7 @@ async def create_optimized_embeddings_v2(documents, model):
                 batch_embeddings = await asyncio.to_thread(
                     lambda: model.encode(
                         batch_texts, 
-                        batch_size=min(64, len(batch_texts)),  # Inner batch for GPU efficiency
+                        batch_size=min(128, len(batch_texts)),  # INCREASED from 32 to 128
                         show_progress_bar=False,
                         convert_to_numpy=True,  # Faster conversion
                         normalize_embeddings=False  # Skip if not needed
@@ -781,6 +816,7 @@ async def _generate_voice_response(question, context, openai_client, domain_cont
     try:
         print(f"🎤 Generating enhanced voice response with context length: {len(context)} chars")
         
+        # Enhanced voice response generation - NO TIMEOUT for quality
         response = await openai_client.chat.completions.create(
             model=LLM_MODEL,
             messages=[{"role": "user", "content": adapted_prompt.format(context=context, question=question)}],
@@ -790,27 +826,81 @@ async def _generate_voice_response(question, context, openai_client, domain_cont
         
         response_text = response.choices[0].message.content.strip()
         
-        # Quality check - Voice response should have source reference
-        if response_text and len(response_text) > 10:
-            # Check if response has source indication (basic check)
-            has_source = any(indicator in response_text.lower() for indicator in [
-                'göre', 'belirtildiği', 'mevzuat', 'dosya', 'madde', 'bölüm', 'kaynak'
-            ])
+        # Response quality kontrolü
+        if not response_text or len(response_text) < 10:
+            print("⚠️ Generated voice response is too short or empty!")
+            response_text = f"Soru ile ilgili bilgiler {domain_context.lower() if domain_context else 'belgelerde'} mevcut ancak yanıt oluşturulmasında teknik bir sorun yaşandı."
+        
+        # 🚨 KRİTİK: Hallucination kontrolü - TEXT ile aynı güvenlik
+        elif "bulunamadı" in response_text.lower() and len(context) > 100:
+            print("🤔 Voice response says 'not found' but context exists. Trying alternative prompt...")
             
-            if not has_source and "bulunamadı" not in response_text.lower():
-                print("⚠️ Voice response lacks source reference, enhancing...")
-                
-                # Enhanced prompt for better source integration
-                enhanced_prompt = f"""Siz Ankara Bilim Üniversitesi'nde uzman sesli asistansınız. 
+            # Alternative prompt - VOICE için KESİN KURALLAR
+            alternative_voice_prompt = f"""Siz Ankara Bilim Üniversitesi'nde uzman sesli asistansınız. 
 
-ÖNEMLI: Kaynak belirtmek ZORUNLUDUR - doğal dil akışında.
+KESİN KURALLAR:
+- YALNIZCA verilen metinlerdeki bilgileri kullanın
+- Bağlam dışında BİLGİ EKLEMEYİN (hallucination YASAK)
+- Metinlerde yoksa "Bu konuda verilen dokümanlarda bilgi bulunamadı" deyin
+- Kaynak belirtmeyi DOĞAL şekilde cümle içine yerleştirin
 
 SORU: {question}
 
-VERİLEN BAĞLAM:
-{context[:1000]}
+VERİLEN METİNLER:
+{context[:1500]}
 
-CEVAP (Kaynak belirterek, kısa ve net):"""
+SESLİ CEVAP (YALNIZCA metinlerdeki bilgileri kullanarak):"""
+            
+            try:
+                alternative_response = await openai_client.chat.completions.create(
+                    model=LLM_MODEL,
+                    messages=[{"role": "user", "content": alternative_voice_prompt}],
+                    temperature=0.0,
+                    max_tokens=400
+                )
+                
+                alternative_result = alternative_response.choices[0].message.content.strip()
+                if alternative_result and not "bulunamadı" in alternative_result.lower():
+                    response_text = alternative_result
+                    print("✅ Alternative voice prompt succeeded!")
+                
+            except Exception as e:
+                print(f"⚠️ Alternative voice prompt failed: {e}")
+        
+        # Quality check - Voice response should have natural source integration
+        elif response_text and len(response_text) > 10:
+            # Enhanced check for natural source integration
+            natural_source_indicators = [
+                'göre', 'belirtildiği', 'açıklandığı', 'uygun olarak', 'maddesinde', 
+                'bölümünde', 'mevzuat', 'belge', 'dosya', 'talimat', 'yönetmelik'
+            ]
+            
+            has_natural_source = any(indicator in response_text.lower() for indicator in natural_source_indicators)
+            
+            # Check if source is mentioned at the end (BAD pattern)
+            ends_with_source = any(end_pattern in response_text.lower()[-50:] for end_pattern in [
+                'kaynak:', 'dosya:', 'referans:', '.pdf', 'belgesi'
+            ])
+            
+            if not has_natural_source or ends_with_source:
+                print("⚠️ Voice response needs better natural source integration, enhancing...")
+                
+                # Ultra-enhanced prompt for natural source integration
+                enhanced_prompt = f"""Siz Ankara Bilim Üniversitesi uzmanısınız. DOĞAL ŞEKİLDE kaynak belirterek yanıt verin.
+
+SORUNUZ: {question}
+
+VERİLEN BELGELER:
+{context[:800]}
+
+ÖNEMLİ: Kaynak belirtmeyi cümle BAŞINDA veya ORTASINDA yapın:
+- "X belgesine göre..."  
+- "Y mevzuatında belirtildiği üzere..."
+- "Z talimatında açıklandığı şekilde..."
+
+SONDA kaynak belirtmek yasaktır!
+
+DOĞAL VE AKICI CEVAP:"""
 
                 try:
                     enhanced_response = await openai_client.chat.completions.create(
@@ -821,9 +911,9 @@ CEVAP (Kaynak belirterek, kısa ve net):"""
                     )
                     
                     enhanced_text = enhanced_response.choices[0].message.content.strip()
-                    if enhanced_text and "göre" in enhanced_text.lower():
+                    if enhanced_text and any(indicator in enhanced_text.lower()[:100] for indicator in natural_source_indicators):
                         response_text = enhanced_text
-                        print("✅ Enhanced voice response with better source integration!")
+                        print("✅ Enhanced voice response with natural source integration!")
                 
                 except Exception as e:
                     print(f"⚠️ Enhanced voice prompt failed: {e}")
@@ -906,12 +996,13 @@ async def ask_question_optimized(question, collection, openai_client, model, cro
     # Combine search results (hızlı, paralel olmasına gerek yok)
     combined_results = _combine_search_results(semantic_results, keyword_results)
     
-    # Smart cross-encoder (mevcut logic korunuyor)
+    # Smart cross-encoder - OPTIMIZED threshold
     if cross_encoder_model and combined_results:
         top_scores = [r['score'] for r in combined_results[:3]]
         score_variance = max(top_scores) - min(top_scores) if len(top_scores) > 1 else 1.0
         
-        if score_variance < 0.15 and len(combined_results) > 3:
+        # More aggressive skipping for speed - increased threshold
+        if score_variance < 0.20 and len(combined_results) > 3:  # Increased from 0.15 to 0.20
             print("🎯 Smart reranking: High uncertainty detected, applying cross-encoder...")
             final_results = await _cross_encoder_rerank(question, combined_results[:10], cross_encoder_model)
         else:
@@ -953,10 +1044,18 @@ async def _create_smart_query_vector_optimized(question, hyde_variants, question
         cache_key = f"emb_{hash(normalized_text)}"
         
         if cache_key in embedding_cache:
-            embeddings.append((i, embedding_cache[cache_key]))
+            cached_emb = embedding_cache[cache_key]
+            # Ensure numpy array format
+            if not isinstance(cached_emb, np.ndarray):
+                cached_emb = np.array(cached_emb)
+            embeddings.append((i, cached_emb))
             cache_hits += 1
         elif i == 0:  # Question embedding already computed
-            embedding_array = np.array(question_embedding)
+            # Ensure numpy array format for question embedding
+            if not isinstance(question_embedding, np.ndarray):
+                embedding_array = np.array(question_embedding)
+            else:
+                embedding_array = question_embedding
             embedding_cache[cache_key] = embedding_array
             embeddings.append((i, embedding_array))
             cache_hits += 1
@@ -970,21 +1069,25 @@ async def _create_smart_query_vector_optimized(question, hyde_variants, question
         batch_embeddings = await asyncio.to_thread(
             model.encode, 
             uncached_texts, 
-            batch_size=min(32, len(uncached_texts)),
+            batch_size=min(128, len(uncached_texts)),  # INCREASED from 32 to 128
             show_progress_bar=False
         )
         
-        # Cache and store results
+        # Cache and store results with consistent format
         for text, embedding, idx in zip(uncached_texts, batch_embeddings, uncached_indices):
             normalized_text = text.strip().lower()
             cache_key = f"emb_{hash(normalized_text)}"
-            embedding_array = np.array(embedding)
+            # Ensure consistent numpy array format
+            if not isinstance(embedding, np.ndarray):
+                embedding_array = np.array(embedding)
+            else:
+                embedding_array = embedding.copy()
             embedding_cache[cache_key] = embedding_array
             embeddings.append((idx, embedding_array))
     
     print(f"🚀 Embedding cache hits: {cache_hits}/{len(all_texts)}, batch processed: {len(uncached_texts)}")
     
-    # Phase 3: Sort and combine (aynı logic korunuyor)
+    # Phase 3: Sort and combine with proper shape handling
     if not embeddings:
         print("❌ No embeddings generated, using fallback")
         return None
@@ -993,16 +1096,40 @@ async def _create_smart_query_vector_optimized(question, hyde_variants, question
     embeddings.sort(key=lambda x: x[0])
     embedding_arrays = [emb[1] for emb in embeddings]
     
+    # Ensure all embeddings have the same shape - QUALITY FIX
+    if embedding_arrays:
+        target_shape = embedding_arrays[0].shape
+        for i, emb in enumerate(embedding_arrays):
+            if emb.shape != target_shape:
+                print(f"⚠️ Shape mismatch detected: {emb.shape} vs {target_shape}, normalizing...")
+                # Proper reshaping - maintain quality
+                if emb.ndim > 1:
+                    embedding_arrays[i] = emb.reshape(-1)  # Flatten properly
+                # Ensure exact same length
+                if len(embedding_arrays[i]) != len(embedding_arrays[0]):
+                    min_len = min(len(embedding_arrays[i]), len(embedding_arrays[0]))
+                    embedding_arrays[i] = embedding_arrays[i][:min_len]
+                    if i == 0:  # Also fix the reference embedding
+                        for j in range(len(embedding_arrays)):
+                            if j != i:
+                                embedding_arrays[j] = embedding_arrays[j][:min_len]
+                        break
+    
     if len(embedding_arrays) == 1:
         final_vector = embedding_arrays[0]
     else:
-        # Ultra-optimized vector combination (aynı logic)
-        original_weight = 0.5
-        hyde_weight = 0.5 / (len(embedding_arrays) - 1) if len(embedding_arrays) > 1 else 0
-        
-        embeddings_array = np.stack(embedding_arrays)
-        weights = np.array([original_weight] + [hyde_weight] * (len(embedding_arrays) - 1))
-        final_vector = np.average(embeddings_array, axis=0, weights=weights)
+        # Ultra-optimized vector combination with shape safety
+        try:
+            original_weight = 0.5
+            hyde_weight = 0.5 / (len(embedding_arrays) - 1) if len(embedding_arrays) > 1 else 0
+            
+            # Stack with shape verification
+            embeddings_array = np.stack(embedding_arrays)
+            weights = np.array([original_weight] + [hyde_weight] * (len(embedding_arrays) - 1))
+            final_vector = np.average(embeddings_array, axis=0, weights=weights)
+        except Exception as e:
+            print(f"⚠️ Vector combination failed: {e}, using first embedding")
+            final_vector = embedding_arrays[0]
     
     print(f"🧮 Created optimized ensemble vector from {len(embedding_arrays)} sources")
     return final_vector
@@ -1081,12 +1208,13 @@ async def ask_question_voice_optimized(question, collection, openai_client, mode
     # Combine search results (hızlı, paralel olmasına gerek yok)
     combined_results = _combine_search_results(semantic_results, keyword_results)
     
-    # Smart cross-encoder (mevcut logic korunuyor)
+    # Smart cross-encoder - OPTIMIZED threshold
     if cross_encoder_model and combined_results:
         top_scores = [r['score'] for r in combined_results[:3]]
         score_variance = max(top_scores) - min(top_scores) if len(top_scores) > 1 else 1.0
         
-        if score_variance < 0.15 and len(combined_results) > 3:
+        # More aggressive skipping for speed - increased threshold
+        if score_variance < 0.20 and len(combined_results) > 3:  # Increased from 0.15 to 0.20
             print("🎯 Smart reranking: High uncertainty detected, applying cross-encoder...")
             final_results = await _cross_encoder_rerank(question, combined_results[:10], cross_encoder_model)
         else:

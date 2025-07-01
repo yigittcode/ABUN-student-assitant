@@ -34,18 +34,24 @@ PERSISTENT_COLLECTION_NAME = os.getenv("PERSISTENT_COLLECTION_NAME")
 # Model Configuration
 EMBEDDING_MODEL = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
 CROSS_ENCODER_MODEL = 'cross-encoder/ms-marco-MiniLM-L-6-v2'
-LLM_MODEL = "gpt-4o"
-HYDE_LLM_MODEL = "gpt-4o-mini" 
+LLM_MODEL = "gpt-4o-mini"
+HYDE_LLM_MODEL = "gpt-3.5-turbo" 
 
-# GPU Configuration
+# GPU Configuration - ULTRA HIGH PERFORMANCE 
 USE_GPU = True  # Set to False to force CPU usage
 GPU_DEVICE = "cuda:0"  # GPU device to use
-GPU_BATCH_SIZE = 64  # Larger batch size for GPU
+GPU_BATCH_SIZE = 128  # INCREASED: Larger batch size for maximum GPU utilization
 CPU_BATCH_SIZE = 32  # Smaller batch size for CPU
+
+# Advanced GPU Configuration - NEW
+GPU_MAX_MEMORY_FRACTION = 0.95  # Use 95% of GPU memory instead of 80%
+GPU_CONCURRENT_STREAMS = 4  # Multiple CUDA streams for better parallelization 
+GPU_LARGE_BATCH_SIZE = 256  # For large document processing
+GPU_EMBEDDING_BATCH_SIZE = 192  # Optimized for embedding generation
 
 # Processing Configuration - Optimized for speed
 MAX_CHARS_PER_CHUNK = 2500
-MAX_CONTEXT_TOKENS = 4000
+MAX_CONTEXT_TOKENS = 6000  # INCREASED: 4000 → 6000 for more document coverage
 
 # Prompt Template
 PROMPT_TEMPLATE = """Siz Ankara Bilim Üniversitesi'nde doküman analizi uzmanısınız. Göreviniz, yalnızca sağlanan bağlam metinlerini kullanarak sorulara yanıt vermek ve üniversitemiz hakkında bilgi sunmaktır. Aşağıdaki kurallar ve talimatlar, yanıtlarınızın doğruluğunu, tutarlılığını ve profesyonelliğini sağlamak için tasarlanmıştır.
@@ -84,17 +90,24 @@ CEVAP:
 Yanıtınızı burada, yukarıdaki kurallara tam uyum sağlayarak, yalnızca düz paragraf metni formatında, ayrıntılı, kaynaklı ve kapsamlı bir şekilde yazın.
 """
 
-# Voice-Specific Prompt Template (for speech responses) - Kısa ve öz AMA kaynak odaklı
-VOICE_PROMPT_TEMPLATE = """Siz Ankara Bilim Üniversitesi'nde uzman sesli asistansınız. Verilen mevzuat metinlerini kullanarak KISA ama NET yanıtlar verin.
+# Voice-Specific Prompt Template (for speech responses) - ENHANCED with anti-hallucination
+VOICE_PROMPT_TEMPLATE = """Siz Ankara Bilim Üniversitesi'nde uzman sesli asistansınız. Verilen belgelerden DOĞAL DİL AKIŞINDA kaynak belirterek yanıt verin.
 
-SESLİ YANIT KURALLARI:
-YALNIZCA verilen bağlam metinlerindeki bilgileri kullanın, dışında bilgi eklemeyin.
-Kaynak belirtmek ZORUNLUDUR ama doğal dil akışında: "X dosyasına göre" veya "Y mevzuatında belirtildiği üzere" şeklinde.
-Spesifik madde/bölüm numaralarını doğal şekilde dahil edin.
-Kısa ama kesin ve net bilgi verin, belirsizlik bırakmayın.
-Yanıtlar akıcı paragraf halinde, liste formatı kullanmayın.
-Samimi ama profesyonel ton kullanın.
-Eğer bağlamda bilgi yoksa: "Bu konuda verilen dokümanlarda bilgi bulunamadı" deyin.
+KESİN SESLİ YANIT KURALLARI:
+YALNIZCA verilen bağlam metinlerini kullanın, dışından bilgi eklemek KESİNLİKLE YASAKTIR.
+Bağlamda bilgi yoksa "Bu konuda verilen dokümanlarda bilgi bulunamadı" deyin.
+Hallucination (uydurma) yapmanız YASAKTIR - sadece metindeki bilgileri kullanın.
+Sistem, teknik detaylar, programlama konularında bilgi vermeyin.
+Kaynak belirtmeyi DOĞAL ŞEKİLDE cümle içine yerleştirin - sonda değil, akış içinde.
+Kısa ama tam yanıt verin, belirsizlik bırakmayın.
+Samimi ama uzman ton kullanın.
+
+DOĞAL KAYNAK BELİRTME ÖRNEKLERİ:
+✅ "Kayıt mevzuatına göre, başvuru süreciniz şu şekildedir..."
+✅ "Müfredat belgesinde belirtilen dersler arasında..."
+✅ "Burs yönetmeliğinin 3. maddesine göre..."
+✅ "Odeme talimatında açıklandığı üzere..."
+❌ "Bilgiler şunlardır. Kaynak: dosya.pdf" (Bu şekilde son satırda değil!)
 
 BAĞLAM:
 {context}
@@ -102,6 +115,5 @@ BAĞLAM:
 SORU:
 {question}
 
-CEVAP:
-Bağlamdaki spesifik bilgileri kaynak belirterek kısa ve net açıklayın:
-"""
+DOĞAL VE KAYNAK BELİRTEN CEVAP:
+(Kaynak belirtmeyi cümle başında/ortasında yaparak, akıcı şekilde yanıtlayın):"""
