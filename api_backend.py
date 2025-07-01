@@ -1083,9 +1083,8 @@ async def process_uploaded_documents(temp_dir: str, uploaded_files: List[str]):
         logger.error(f"❌ Critical error in document processing: {e}")
     finally:
         # Clean up temporary directory
-        if os.path.exists(temp_dir):
-            shutil.rmtree(temp_dir, ignore_errors=True)
-            logger.info(f"🧹 Cleaned up temporary directory: {temp_dir}")
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        logger.info(f"🧹 Cleaned up temporary directory: {temp_dir}")
 
 async def process_uploaded_documents_with_progress(session_id: str, temp_dir: str, uploaded_files: List[str]):
     """Process uploaded documents with progress tracking"""
@@ -1235,8 +1234,8 @@ async def process_uploaded_documents_with_progress(session_id: str, temp_dir: st
                     )
     finally:
         # Clean up temporary directory
-            shutil.rmtree(temp_dir, ignore_errors=True)
-            logger.info(f"🧹 Cleaned up temporary directory: {temp_dir}")
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        logger.info(f"🧹 Cleaned up temporary directory: {temp_dir}")
 
 # =================== SPEECH ENDPOINTS ===================
 

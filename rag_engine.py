@@ -728,39 +728,51 @@ async def _generate_contextual_response(question, context, openai_client, domain
         
         # İçerik varlığını kontrol et - eğer "bulunamadı" diyorsa context'te gerçekten yok mu kontrol et
         elif "bulunamadı" in result.lower() and len(context) > 100:
-            print("🤔 Response says 'not found' but context exists. Trying alternative prompt...")
+            print("🤔 Response says 'not found' but context exists. Trying enhanced alternative prompt...")
             
-            # Alternative prompt - KURALLAR DAHİL
+            # ENHANCED Alternative prompt - Daha sıkı kurallar ve örnekler
             alternative_prompt = f"""Siz Ankara Bilim Üniversitesi'nde doküman analizi uzmanısınız. 
 
-KESİN KURALLAR:
-- YALNIZCA verilen metinlerdeki bilgileri kullanın
-- Bağlam dışında BİLGİ EKLEMEYİN (React, programlama, genel konular KESİNLİKLE YASAK)
-- Metinlerde yoksa "Bu konuda verilen dokümanlarda bilgi bulunamadı" deyin
-- Kaynak referansı verin: [Kaynak: dosya_adı]
+KRİTİK KURALLAR:
+1. YALNIZCA verilen metinlerdeki SOMUT bilgileri kullanın
+2. "Genel olarak", "genellikle", "civarında" gibi belirsiz ifadeler YASAK
+3. Eğer metinlerde SPESİFİK bilgi yoksa "Bu konuda verilen dokümanlarda spesifik bilgi bulunamadı" deyin
+4. ASLA genel bilgi, tahmin veya varsayım eklemeyin
+5. Her bilgi için [Kaynak: dosya_adı] referansı verin
+
+ÖRNEK YANIT FORMATI:
+- DOĞRU: "Sınav yönetmeliğine göre, 2.00 altı ortalama alanlara 15 AKTS sınırı var [Kaynak: sinav.pdf]"
+- YANLIŞ: "Genel olarak 30 AKTS alabilirsiniz ama kesin bilgi için müfredata bakın"
 
 SORU: {question}
 
 VERİLEN METİNLER:
-{context[:2000]}
+{context[:2500]}
 
-CEVAP (YALNIZCA metinlerdeki bilgileri kullanarak):"""
+SPESİFİK CEVAP (Sadece metinlerdeki somut bilgilerle):"""
             
             try:
                 alternative_response = await openai_client.chat.completions.create(
                     model=LLM_MODEL,
                     messages=[{"role": "user", "content": alternative_prompt}],
                     temperature=0.0,
-                    max_tokens=800
+                    max_tokens=600
                 )
                 
                 alternative_result = alternative_response.choices[0].message.content.strip()
-                if alternative_result and not "bulunamadı" in alternative_result.lower():
+                
+                # Kalite kontrolü - genel laflar var mı?
+                bad_phrases = ["genel olarak", "genellikle", "civarında", "yaklaşık", "ortalama olarak", "genelde"]
+                has_bad_phrases = any(phrase in alternative_result.lower() for phrase in bad_phrases)
+                
+                if alternative_result and not "bulunamadı" in alternative_result.lower() and not has_bad_phrases:
                     result = alternative_result
-                    print("✅ Alternative prompt succeeded!")
+                    print("✅ Enhanced alternative prompt succeeded!")
+                elif has_bad_phrases:
+                    print("⚠️ Alternative prompt still contains vague language, keeping original")
                 
             except Exception as e:
-                print(f"⚠️ Alternative prompt failed: {e}")
+                print(f"⚠️ Enhanced alternative prompt failed: {e}")
         
         api_cache[prompt_key] = result
         print(f"✅ Generated response: {len(result)} characters")
@@ -927,7 +939,7 @@ async def _generate_voice_response(question, context, openai_client, domain_cont
             model=LLM_MODEL,
             messages=[{"role": "user", "content": adapted_prompt.format(context=context, question=question)}],
             temperature=0.1,
-            max_tokens=600  # Increased for source references: 400→600
+            max_tokens=800  # Increased for better coverage: 600→800 to match text quality
         )
         
         response_text = response.choices[0].message.content.strip()
@@ -939,87 +951,104 @@ async def _generate_voice_response(question, context, openai_client, domain_cont
         
         # 🚨 KRİTİK: Hallucination kontrolü - TEXT ile aynı güvenlik
         elif "bulunamadı" in response_text.lower() and len(context) > 100:
-            print("🤔 Voice response says 'not found' but context exists. Trying alternative prompt...")
+            print("🤔 Voice response says 'not found' but context exists. Trying enhanced alternative voice prompt...")
             
-            # Alternative prompt - VOICE için KESİN KURALLAR
+            # ENHANCED Alternative prompt - VOICE için SIKI KURALLAR
             alternative_voice_prompt = f"""Siz Ankara Bilim Üniversitesi'nde uzman sesli asistansınız. 
 
-KESİN KURALLAR:
-- YALNIZCA verilen metinlerdeki bilgileri kullanın
-- Bağlam dışında BİLGİ EKLEMEYİN (hallucination YASAK)
-- Metinlerde yoksa "Bu konuda verilen dokümanlarda bilgi bulunamadı" deyin
-- Kaynak belirtmeyi DOĞAL şekilde cümle içine yerleştirin
+SESLİ YANIT KRİTİK KURALLARI:
+1. YALNIZCA verilen metinlerdeki SOMUT bilgileri kullanın
+2. "Genel olarak", "genellikle", "civarında" gibi belirsiz ifadeler YASAK
+3. Eğer metinlerde SPESİFİK bilgi yoksa "Bu konuda verilen dokümanlarda spesifik bilgi bulunamadı" deyin
+4. ASLA tahmin, varsayım veya genel bilgi eklemeyin
+5. Kaynak belirtmeyi DOĞAL şekilde cümle içine yerleştirin
+
+DOĞRU SESLI CEVAP ÖRNEKLERİ:
+- "Sınav yönetmeliğine göre 2.15 ortalamalı öğrenciler için 20 AKTS sınırı var"
+- "Bu konuda verilen dokümanlarda spesifik bilgi bulunamadı"
+
+YANLIŞ CEVAP ÖRNEKLERİ:
+- "Genel olarak 30 AKTS alabilirsiniz"
+- "Programınıza göre değişir ama yaklaşık..."
 
 SORU: {question}
 
 VERİLEN METİNLER:
-{context[:1500]}
+{context[:1800]}
 
-SESLİ CEVAP (YALNIZCA metinlerdeki bilgileri kullanarak):"""
+SPESİFİK SESLİ CEVAP (Sadece metinlerdeki somut bilgilerle):"""
             
             try:
                 alternative_response = await openai_client.chat.completions.create(
                     model=LLM_MODEL,
                     messages=[{"role": "user", "content": alternative_voice_prompt}],
                     temperature=0.0,
-                    max_tokens=400
+                    max_tokens=350
                 )
                 
                 alternative_result = alternative_response.choices[0].message.content.strip()
-                if alternative_result and not "bulunamadı" in alternative_result.lower():
+                
+                # Voice için de kalite kontrolü
+                bad_phrases = ["genel olarak", "genellikle", "civarında", "yaklaşık", "ortalama olarak", "genelde"]
+                has_bad_phrases = any(phrase in alternative_result.lower() for phrase in bad_phrases)
+                
+                if alternative_result and not "bulunamadı" in alternative_result.lower() and not has_bad_phrases:
                     response_text = alternative_result
-                    print("✅ Alternative voice prompt succeeded!")
+                    print("✅ Enhanced alternative voice prompt succeeded!")
+                elif has_bad_phrases:
+                    print("⚠️ Alternative voice prompt still contains vague language, keeping original")
                 
             except Exception as e:
-                print(f"⚠️ Alternative voice prompt failed: {e}")
+                print(f"⚠️ Enhanced alternative voice prompt failed: {e}")
         
         # Quality check - Voice response should have natural source integration
         elif response_text and len(response_text) > 10:
-            # Enhanced check for natural source integration
+            # Simple check for natural source integration
             natural_source_indicators = [
-                'göre', 'belirtildiği', 'açıklandığı', 'uygun olarak', 'maddesinde', 
-                'bölümünde', 'mevzuat', 'belge', 'dosya', 'talimat', 'yönetmelik'
+                'göre', 'belirtildiği', 'açıklandığı', 'maddesinde', 
+                'bölümünde', 'mevzuat', 'talimat', 'yönetmelik'
             ]
             
-            has_natural_source = any(indicator in response_text.lower() for indicator in natural_source_indicators)
+            has_natural_source = any(indicator in response_text.lower()[:150] for indicator in natural_source_indicators)
             
             # Check if source is mentioned at the end (BAD pattern)
-            ends_with_source = any(end_pattern in response_text.lower()[-50:] for end_pattern in [
-                'kaynak:', 'dosya:', 'referans:', '.pdf', 'belgesi'
+            ends_with_bad_source = any(end_pattern in response_text.lower()[-80:] for end_pattern in [
+                'kaynak:', 'dosya:', 'referans:', '.pdf'
             ])
             
-            if not has_natural_source or ends_with_source:
+            # Simple fix: If no natural source in beginning or ends with bad source, try enhancement once
+            if not has_natural_source or ends_with_bad_source:
                 print("⚠️ Voice response needs better natural source integration, enhancing...")
                 
-                # Ultra-enhanced prompt for natural source integration
-                enhanced_prompt = f"""Siz Ankara Bilim Üniversitesi uzmanısınız. DOĞAL ŞEKİLDE kaynak belirterek yanıt verin.
+                # Simplified enhancement prompt
+                enhanced_prompt = f"""Siz Ankara Bilim Üniversitesi uzmanısınız. Kaynak belirtmeyi BAŞTA yaparak yanıt verin.
 
-SORUNUZ: {question}
+SORU: {question}
 
 VERİLEN BELGELER:
-{context[:800]}
+{context[:1000]}
 
-ÖNEMLİ: Kaynak belirtmeyi cümle BAŞINDA veya ORTASINDA yapın:
+ÖNEMLİ: Cümle BAŞINDA kaynak belirtin:
 - "X belgesine göre..."  
 - "Y mevzuatında belirtildiği üzere..."
-- "Z talimatında açıklandığı şekilde..."
 
-SONDA kaynak belirtmek yasaktır!
-
-DOĞAL VE AKICI CEVAP:"""
+DOĞAL CEVAP (kaynak başta):"""
 
                 try:
                     enhanced_response = await openai_client.chat.completions.create(
                         model=LLM_MODEL,
                         messages=[{"role": "user", "content": enhanced_prompt}],
                         temperature=0.0,
-                        max_tokens=500
+                        max_tokens=600
                     )
                     
                     enhanced_text = enhanced_response.choices[0].message.content.strip()
+                    # Simple validation: Check if enhancement worked
                     if enhanced_text and any(indicator in enhanced_text.lower()[:100] for indicator in natural_source_indicators):
                         response_text = enhanced_text
                         print("✅ Enhanced voice response with natural source integration!")
+                    else:
+                        print("⚠️ Enhancement didn't improve source integration, keeping original")
                 
                 except Exception as e:
                     print(f"⚠️ Enhanced voice prompt failed: {e}")
