@@ -31,7 +31,7 @@ from config import (
     JWT_EXPIRE_MINUTES, ADMIN_EMAIL, ADMIN_PASSWORD, PERSISTENT_COLLECTION_NAME,
     USE_GPU, GPU_DEVICE, GPU_BATCH_SIZE, CPU_BATCH_SIZE
 )
-from rag_engine import ask_question, ask_question_stream, ask_question_voice, create_optimized_embeddings
+from rag_engine import ask_question, ask_question_stream, ask_question_voice, create_optimized_embeddings, ask_question_optimized, ask_question_voice_optimized
 from document_processor import load_and_process_documents
 from mongodb_manager import MongoDBManager
 from speech_integration import SpeechProcessor
@@ -443,8 +443,8 @@ async def chat_with_documents(message: ChatMessage):
         
         collection = weaviate_client.collections.get(PERSISTENT_COLLECTION_NAME)
         
-        # Process the question
-        answer, sources_metadata = await ask_question(
+        # Process the question - OPTIMIZED VERSION
+        answer, sources_metadata = await ask_question_optimized(
             question=message.message.strip(),
             collection=collection,
             openai_client=openai_client,
@@ -488,8 +488,8 @@ async def chat_with_documents_stream(message: ChatMessage):
                 collected_response = ""
                 sources_metadata = []
                 
-                # Use normal ask_question for consistent quality, then simulate streaming
-                answer, sources_metadata = await ask_question(
+                # Use optimized ask_question for better performance, then simulate streaming
+                answer, sources_metadata = await ask_question_optimized(
                     question=message.message.strip(),
                     collection=collection,
                     openai_client=openai_client,
@@ -1173,9 +1173,9 @@ async def speech_to_speech_endpoint(
         collection = weaviate_client.collections.get(PERSISTENT_COLLECTION_NAME)
         
         logger.info("🧠 Processing with RAG engine...")
-        # RAG işlemi - Her step'te disconnection check
+        # RAG işlemi - OPTIMIZED VERSION with disconnection check
         try:
-            rag_response, sources_metadata = await ask_question_voice(
+            rag_response, sources_metadata = await ask_question_voice_optimized(
                 question=recognized_text.strip(),
                 collection=collection,
                 openai_client=openai_client,
@@ -1263,7 +1263,7 @@ async def text_to_speech_endpoint(
         
         logger.info(f"🧠 Processing text query: {text}")
         try:
-            rag_response, sources_metadata = await ask_question_voice(
+            rag_response, sources_metadata = await ask_question_voice_optimized(
                 question=text.strip(),
                 collection=collection,
                 openai_client=openai_client,
@@ -1334,46 +1334,191 @@ async def get_speech_voices():
         "default": "tr-TR-EmelNeural"
     }
 
-if __name__ == "__main__":
-    print("🚀 Starting IntelliDocs API Backend v2.0...")
-    print("📚 Advanced RAG API with persistent document storage")
-    print("🔗 API will be available at: http://localhost:8000")
-    print("📖 API Documentation: http://localhost:8000/docs")
+@app.post("/api/chat/compare")
+async def compare_performance(message: ChatMessage, token: AuthRequired):
+    """🚀 Performance comparison: Original vs Optimized RAG systems"""
+    global weaviate_client, openai_client, embedding_model, cross_encoder_model, mongodb_manager
     
-    uvicorn.run(
-        "api_backend:app",
-        host="0.0.0.0",
-        port=8000,
-        reload=True,
-        log_level="info"
-    )
-
-        try:
-            return FileResponse(
-                audio_path,
-                media_type="audio/mpeg", 
-                filename="response.mp3",
-                headers={"Cache-Control": "no-cache"}
-            )
-        except (ConnectionResetError, BrokenPipeError):
-            logger.info("🚪 Connection broken while sending response")
-            raise HTTPException(status_code=499, detail="Connection broken")
+    try:
+        # Get persistent collection
+        if not weaviate_client.collections.exists(PERSISTENT_COLLECTION_NAME):
+            raise HTTPException(status_code=404, detail="No documents available for chat. Please upload documents first.")
         
-    except HTTPException:
-        raise
+        collection = weaviate_client.collections.get(PERSISTENT_COLLECTION_NAME)
+        
+        import time
+        
+        # 🐌 Test ORIGINAL version
+        print("🐌 Testing ORIGINAL RAG system...")
+        start_time = time.time()
+        
+        original_answer, original_sources = await ask_question(
+            question=message.message.strip(),
+            collection=collection,
+            openai_client=openai_client,
+            model=embedding_model,
+            cross_encoder_model=cross_encoder_model,
+            domain_context=""
+        )
+        
+        original_time = time.time() - start_time
+        print(f"🐌 Original completed in: {original_time:.2f}s")
+        
+        # 🚀 Test OPTIMIZED version
+        print("🚀 Testing OPTIMIZED RAG system...")
+        start_time = time.time()
+        
+        optimized_answer, optimized_sources = await ask_question_optimized(
+            question=message.message.strip(),
+            collection=collection,
+            openai_client=openai_client,
+            model=embedding_model,
+            cross_encoder_model=cross_encoder_model,
+            domain_context=""
+        )
+        
+        optimized_time = time.time() - start_time
+        print(f"🚀 Optimized completed in: {optimized_time:.2f}s")
+        
+        # Calculate improvement
+        speed_improvement = ((original_time - optimized_time) / original_time) * 100 if original_time > 0 else 0
+        
+        # Store comparison results
+        mongodb_manager.store_chat_message(
+            question=message.message.strip(),
+            answer=optimized_answer,
+            sources=optimized_sources,
+            interaction_type="performance_test"
+        )
+        
+        return {
+            "question": message.message.strip(),
+            "performance": {
+                "original_time": round(original_time, 3),
+                "optimized_time": round(optimized_time, 3), 
+                "speed_improvement_percent": round(speed_improvement, 1),
+                "faster_by": round(original_time - optimized_time, 3)
+            },
+            "responses": {
+                "original": {
+                    "answer": original_answer,
+                    "sources": original_sources[:3]  # Top 3 sources
+                },
+                "optimized": {
+                    "answer": optimized_answer,
+                    "sources": optimized_sources[:3]  # Top 3 sources
+                }
+            },
+            "quality_check": {
+                "answers_similar": len(set(original_answer.split()) & set(optimized_answer.split())) > len(original_answer.split()) * 0.7,
+                "source_overlap": len([s for s in optimized_sources[:5] if s in original_sources[:5]]) >= 3
+            },
+            "timestamp": datetime.now().isoformat()
+        }
+        
     except Exception as e:
-        logger.error(f"❌ Text-to-Speech error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"❌ Error in performance comparison: {e}")
+        raise HTTPException(status_code=500, detail=f"Error in performance comparison: {str(e)}")
 
-@app.get("/api/speech/voices")
-async def get_speech_voices():
-    """Mevcut sesleri listele"""
-    global speech_processor
+@app.post("/api/voice/compare")
+async def compare_voice_responses(message: ChatMessage, token: AuthRequired):
+    """🎤 Voice vs Text Response comparison - Test voice enhancement"""
+    global weaviate_client, openai_client, embedding_model, cross_encoder_model, mongodb_manager
     
-    return {
-        "voices": speech_processor.get_available_voices() if speech_processor else {},
-        "default": "tr-TR-EmelNeural"
-    }
+    try:
+        # Get persistent collection
+        if not weaviate_client.collections.exists(PERSISTENT_COLLECTION_NAME):
+            raise HTTPException(status_code=404, detail="No documents available for chat. Please upload documents first.")
+        
+        collection = weaviate_client.collections.get(PERSISTENT_COLLECTION_NAME)
+        
+        import time
+        
+        # 📝 Test NORMAL text response (detailed, with formal source references)
+        print("📝 Testing NORMAL TEXT response...")
+        start_time = time.time()
+        
+        text_answer, text_sources = await ask_question_optimized(
+            question=message.message.strip(),
+            collection=collection,
+            openai_client=openai_client,
+            model=embedding_model,
+            cross_encoder_model=cross_encoder_model,
+            domain_context=""
+        )
+        
+        text_time = time.time() - start_time
+        print(f"📝 Text response completed in: {text_time:.2f}s")
+        
+        # 🎤 Test ENHANCED voice response (concise but source-aware)
+        print("🎤 Testing ENHANCED VOICE response...")
+        start_time = time.time()
+        
+        voice_answer, voice_sources = await ask_question_voice_optimized(
+            question=message.message.strip(),
+            collection=collection,
+            openai_client=openai_client,
+            model=embedding_model,
+            cross_encoder_model=cross_encoder_model,
+            domain_context=""
+        )
+        
+        voice_time = time.time() - start_time
+        print(f"🎤 Voice response completed in: {voice_time:.2f}s")
+        
+        # Analyze differences
+        text_has_formal_refs = "[Kaynak:" in text_answer
+        voice_has_natural_refs = any(indicator in voice_answer.lower() for indicator in [
+            'göre', 'belirtildiği', 'mevzuat', 'dosya', 'madde', 'bölüm'
+        ])
+        
+        # Store comparison results
+        mongodb_manager.store_chat_message(
+            question=message.message.strip(),
+            answer=voice_answer,
+            sources=voice_sources,
+            interaction_type="voice_comparison_test"
+        )
+        
+        return {
+            "question": message.message.strip(),
+            "performance": {
+                "text_time": round(text_time, 3),
+                "voice_time": round(voice_time, 3),
+                "time_difference": round(abs(text_time - voice_time), 3)
+            },
+            "responses": {
+                "text": {
+                    "answer": text_answer,
+                    "length": len(text_answer),
+                    "has_formal_sources": text_has_formal_refs,
+                    "sources": text_sources[:3]
+                },
+                "voice": {
+                    "answer": voice_answer,
+                    "length": len(voice_answer),
+                    "has_natural_sources": voice_has_natural_refs,
+                    "sources": voice_sources[:3]
+                }
+            },
+            "analysis": {
+                "voice_is_shorter": len(voice_answer) < len(text_answer),
+                "length_ratio": round(len(voice_answer) / len(text_answer) if len(text_answer) > 0 else 0, 2),
+                "both_have_sources": text_has_formal_refs and voice_has_natural_refs,
+                "source_overlap": len([s for s in voice_sources[:5] if s in text_sources[:5]]) >= 3
+            },
+            "improvement_notes": {
+                "voice_conciseness": "Voice response should be shorter and more natural",
+                "source_integration": "Voice should have natural source references",
+                "same_accuracy": "Both should reference same source materials",
+                "speech_friendly": "Voice should be conversational and flow well"
+            },
+            "timestamp": datetime.now().isoformat()
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Error in voice comparison: {e}")
+        raise HTTPException(status_code=500, detail=f"Error in voice comparison: {str(e)}")
 
 if __name__ == "__main__":
     print("🚀 Starting IntelliDocs API Backend v2.0...")

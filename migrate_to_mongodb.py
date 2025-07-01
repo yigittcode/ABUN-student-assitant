@@ -268,10 +268,3 @@ if __name__ == "__main__":
         print("\n⏸️ Migration interrupted by user")
     except Exception as e:
         print(f"\n❌ Migration failed: {e}")
-        exit(1)
-        print("🔄 You can now use the new API backend (api_backend_v2.py)")
-        
-    except KeyboardInterrupt:
-        print("\n⏸️ Migration interrupted by user")
-    except Exception as e:
-        print(f"\n❌ Migration failed: {e}")
