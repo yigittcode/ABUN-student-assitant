@@ -491,6 +491,112 @@ async def _cross_encoder_rerank(question, results, cross_encoder_model):
         return results
 
 
+def _check_and_correct_critical_typos(question):
+    """
+    Kritik üniversite terminolojisindeki açık yazım hatalarını tespit et ve düzelt
+    
+    Args:
+        question: Kullanıcının sorusu
+        
+    Returns:
+        Düzeltilmiş soru (hata yoksa orijinal)
+    """
+    # Kritik kelime düzeltme sözlüğü - sadece AÇIK hatalar
+    critical_corrections = {
+        # Burs/Burç hataları
+        "burç": "burs",
+        "burcu": "bursu", 
+        "burclu": "burslu",
+        "burçlu": "burslu",
+        "başarı burcu": "başarı bursu",
+        "tam burçlu": "tam burslu",
+        
+        # Diğer kritik hatalar
+        "disciplin": "disiplin",
+        "diciplin": "disiplin", 
+        "universitesi": "üniversitesi",
+        "universite": "üniversite",
+        "mufredat": "müfredat",
+        "ortalamasi": "ortalaması",
+        "ögrenci": "öğrenci",
+        "ogrenci": "öğrenci",
+        "sinav": "sınav",
+        "sınawi": "sınavı",
+        
+        # Not/Harf karışıklığı
+        "har notu": "harf notu",
+        "har notuna": "harf notuna",
+        "har notları": "harf notları"
+    }
+    
+    corrected = question
+    original_question = question.lower()
+    corrections_made = []
+    
+    # Kelime kelime kontrol et
+    for wrong, correct in critical_corrections.items():
+        if wrong in original_question:
+            # Case-sensitive replacement
+            import re
+            # Kelime sınırlarında eşleşme (whole word)
+            pattern = r'\b' + re.escape(wrong) + r'\b'
+            if re.search(pattern, corrected, re.IGNORECASE):
+                corrected = re.sub(pattern, correct, corrected, flags=re.IGNORECASE)
+                corrections_made.append(f"'{wrong}' → '{correct}'")
+    
+    if corrections_made:
+        print(f"🔧 Düzeltmeler yapıldı: {', '.join(corrections_made)}")
+    
+    return corrected
+
+def _is_meaningless_question(question):
+    """
+    Anlamsız soruları tespit et
+    
+    Args:
+        question: Kullanıcının sorusu
+        
+    Returns:
+        True if meaningless, False if meaningful
+    """
+    question_lower = question.lower().strip()
+    
+    # Çok kısa sorular (3 kelimeden az)
+    words = question_lower.split()
+    if len(words) < 3:
+        # İstisnalar: "nedir", "kimdir" gibi valid single words
+        valid_short_questions = ["nedir", "kimdir", "nelerdir", "nasıl", "ne", "kim", "nerede", "ne zaman"]
+        if not any(valid in question_lower for valid in valid_short_questions):
+            return True
+    
+    # Çok uzun anlamlı cümleler (150+ karakter) ama soru değil
+    if len(question) > 150 and not any(q_word in question_lower for q_word in ["?", "nedir", "nasıl", "ne", "neden", "niçin", "kim", "nerede", "ne zaman", "hangi"]):
+        return True
+    
+    # Saçma kelime kombinasyonları
+    nonsense_patterns = [
+        "asdfsadf", "qwerty", "asdasd", "123123", "test test", 
+        "zxcvzxcv", "adsasd", "qweqwe", "uiuiui", "hjkhkj",
+        "lol lol", "haha haha", "wtf", "omg omg",
+        "random random", "blabla", "lalala", "hahaha",
+        "gggggg", "ssssss", "dddddd", "ffffff"
+    ]
+    
+    for pattern in nonsense_patterns:
+        if pattern in question_lower:
+            return True
+    
+    # Çok tekrarlayan karakterler (aaaaaa, 111111)
+    import re
+    if re.search(r'(.)\1{5,}', question_lower):  # 6+ aynı karakter
+        return True
+    
+    # Sadece sayı veya özel karakter
+    if re.match(r'^[0-9\W]+$', question_lower):
+        return True
+    
+    return False
+
 def _estimate_tokens_fast(text):
     """Hızlı token tahmini - %99.5 doğruluk, 10x hızlı"""
     # GPT tokenizer için optimize edilmiş tahmin
@@ -935,6 +1041,18 @@ async def ask_question_optimized(question, collection, openai_client, model, cro
     if domain_context:
         print(f"📄 Domain context: {domain_context}")
     
+    # 🔍 Yazım hatası kontrolü - critical words için
+    corrected_question = _check_and_correct_critical_typos(question)
+    if corrected_question != question:
+        print(f"⚠️ Yazım hatası tespit edildi ve düzeltildi: '{question}' → '{corrected_question}'")
+        # Kullanıcıya hata mesajı dön
+        return f"Sorunuzda yazım hatası tespit ettim. '{question}' yerine '{corrected_question}' mi demek istediniz? Lütfen doğru yazımla tekrar deneyin.", []
+    
+    # 🚨 Anlamsızlık kontrolü - çok saçma sorular için
+    if _is_meaningless_question(question):
+        print(f"🚫 Anlamsız soru tespit edildi: '{question}'")
+        return "Bu soru anlam ifade etmiyor. Lütfen Ankara Bilim Üniversitesi ile ilgili net ve anlaşılır bir soru sorun.", []
+    
     # 🚀 PHASE 1: Parallel başlatma - HyDE + Basic Embedding + Keyword Search
     print("⚡ Phase 1: Parallel initialization...")
     
@@ -1087,7 +1205,7 @@ async def _create_smart_query_vector_optimized(question, hyde_variants, question
     
     print(f"🚀 Embedding cache hits: {cache_hits}/{len(all_texts)}, batch processed: {len(uncached_texts)}")
     
-    # Phase 3: Sort and combine with proper shape handling
+    # Phase 3: Sort and combine with ROBUST shape handling
     if not embeddings:
         print("❌ No embeddings generated, using fallback")
         return None
@@ -1096,42 +1214,88 @@ async def _create_smart_query_vector_optimized(question, hyde_variants, question
     embeddings.sort(key=lambda x: x[0])
     embedding_arrays = [emb[1] for emb in embeddings]
     
-    # Ensure all embeddings have the same shape - QUALITY FIX
-    if embedding_arrays:
-        target_shape = embedding_arrays[0].shape
-        for i, emb in enumerate(embedding_arrays):
-            if emb.shape != target_shape:
-                print(f"⚠️ Shape mismatch detected: {emb.shape} vs {target_shape}, normalizing...")
-                # Proper reshaping - maintain quality
-                if emb.ndim > 1:
-                    embedding_arrays[i] = emb.reshape(-1)  # Flatten properly
-                # Ensure exact same length
-                if len(embedding_arrays[i]) != len(embedding_arrays[0]):
-                    min_len = min(len(embedding_arrays[i]), len(embedding_arrays[0]))
-                    embedding_arrays[i] = embedding_arrays[i][:min_len]
-                    if i == 0:  # Also fix the reference embedding
-                        for j in range(len(embedding_arrays)):
-                            if j != i:
-                                embedding_arrays[j] = embedding_arrays[j][:min_len]
-                        break
+    # 🔧 ROBUST Shape Normalization - Fix mismatch once and for all
+    target_dim = 768  # Standard sentence transformer dimension
     
+    if embedding_arrays:
+        print(f"🔧 Shape normalization: Processing {len(embedding_arrays)} embeddings")
+        normalized_embeddings = []
+        
+        # Step 1: Validate target dimension by checking first valid embedding
+        for emb in embedding_arrays:
+            if isinstance(emb, np.ndarray):
+                flat_emb = emb.flatten()
+                if flat_emb.shape[0] == 768:  # Standard sentence transformer dimension
+                    target_dim = 768
+                    break
+                elif flat_emb.shape[0] > 0:  # Any valid dimension as fallback
+                    target_dim = flat_emb.shape[0]
+        
+        print(f"🎯 Target dimension: {target_dim}")
+        
+        # Step 2: Normalize all embeddings to consistent 1D shape
+        for i, emb in enumerate(embedding_arrays):
+            try:
+                # Convert to numpy if needed
+                if not isinstance(emb, np.ndarray):
+                    emb = np.array(emb)
+                
+                # Flatten to 1D
+                flat_emb = emb.flatten()
+                
+                # Handle dimension mismatches
+                if flat_emb.shape[0] == target_dim:
+                    # Perfect match
+                    normalized_embeddings.append(flat_emb)
+                elif flat_emb.shape[0] > target_dim:
+                    # Too long: truncate (rare case)
+                    print(f"⚠️ Truncating embedding {i}: {flat_emb.shape[0]} → {target_dim}")
+                    normalized_embeddings.append(flat_emb[:target_dim])
+                else:
+                    # Too short: pad with zeros (rare case)
+                    print(f"⚠️ Padding embedding {i}: {flat_emb.shape[0]} → {target_dim}")
+                    padded = np.zeros(target_dim)
+                    padded[:flat_emb.shape[0]] = flat_emb
+                    normalized_embeddings.append(padded)
+                    
+            except Exception as e:
+                print(f"❌ Error normalizing embedding {i}: {e}")
+                # Emergency fallback: create zero vector
+                normalized_embeddings.append(np.zeros(target_dim))
+        
+        embedding_arrays = normalized_embeddings
+        print(f"✅ All embeddings normalized to shape: ({target_dim},)")
+    else:
+        print("❌ No embedding arrays to normalize")
+        return np.zeros(target_dim)
+    
+    # Phase 4: Smart vector combination (now all shapes are consistent!)
     if len(embedding_arrays) == 1:
         final_vector = embedding_arrays[0]
+        print(f"🧮 Single embedding used: shape {final_vector.shape}")
     else:
-        # Ultra-optimized vector combination with shape safety
+        # Ultra-optimized vector combination - now guaranteed to work!
         try:
             original_weight = 0.5
             hyde_weight = 0.5 / (len(embedding_arrays) - 1) if len(embedding_arrays) > 1 else 0
             
-            # Stack with shape verification
+            # Stack normalized embeddings (guaranteed same shape)
             embeddings_array = np.stack(embedding_arrays)
             weights = np.array([original_weight] + [hyde_weight] * (len(embedding_arrays) - 1))
             final_vector = np.average(embeddings_array, axis=0, weights=weights)
+            
+            print(f"🧮 Combined {len(embedding_arrays)} embeddings into ensemble: shape {final_vector.shape}")
+            
         except Exception as e:
-            print(f"⚠️ Vector combination failed: {e}, using first embedding")
+            print(f"❌ Vector combination failed: {e}, using first embedding")
             final_vector = embedding_arrays[0]
     
-    print(f"🧮 Created optimized ensemble vector from {len(embedding_arrays)} sources")
+    # Final validation
+    if final_vector is None or len(final_vector) == 0:
+        print("🚨 Critical: Final vector is empty, using zero fallback")
+        final_vector = np.zeros(target_dim)
+    
+    print(f"✅ Created optimized ensemble vector: {final_vector.shape}")
     return final_vector
 
 
@@ -1140,6 +1304,18 @@ async def ask_question_voice_optimized(question, collection, openai_client, mode
     print(f"\n🎤 Processing voice question (OPTIMIZED): {question}")
     if domain_context:
         print(f"📄 Domain context: {domain_context}")
+    
+    # 🔍 Yazım hatası kontrolü - critical words için (voice için de)
+    corrected_question = _check_and_correct_critical_typos(question)
+    if corrected_question != question:
+        print(f"⚠️ Voice yazım hatası tespit edildi ve düzeltildi: '{question}' → '{corrected_question}'")
+        # Kullanıcıya hata mesajı dön
+        return f"Sorunuzda yazım hatası tespit ettim. '{question}' yerine '{corrected_question}' mi demek istediniz? Lütfen doğru telaffuzla tekrar deneyin.", []
+    
+    # 🚨 Anlamsızlık kontrolü - çok saçma sorular için (voice için de)
+    if _is_meaningless_question(question):
+        print(f"🚫 Anlamsız voice soru tespit edildi: '{question}'")
+        return "Bu soru anlam ifade etmiyor. Lütfen Ankara Bilim Üniversitesi ile ilgili net ve anlaşılır bir soru sorun.", []
     
     # Helper function for checking disconnection (aynı logic)
     async def check_disconnection(step_name):
