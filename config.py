@@ -37,6 +37,12 @@ CROSS_ENCODER_MODEL = 'cross-encoder/ms-marco-MiniLM-L-6-v2'
 LLM_MODEL = "gpt-4o"
 HYDE_LLM_MODEL = "gpt-4o-mini" 
 
+# GPU Configuration
+USE_GPU = True  # Set to False to force CPU usage
+GPU_DEVICE = "cuda:0"  # GPU device to use
+GPU_BATCH_SIZE = 64  # Larger batch size for GPU
+CPU_BATCH_SIZE = 32  # Smaller batch size for CPU
+
 # Processing Configuration - Optimized for speed
 MAX_CHARS_PER_CHUNK = 2500
 MAX_CONTEXT_TOKENS = 4000
@@ -98,3 +104,8 @@ SORU:
 CEVAP:
 Ana fikri kısa ve sade açıklayın:
 """
+SORU:
+{question}
+
+CEVAP:
+Ana fikri kısa ve sade açıklayın:

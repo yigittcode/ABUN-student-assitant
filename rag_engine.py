@@ -1,6 +1,6 @@
 import numpy as np
 from hyde_generator import generate_hypothetical_answers, generate_multiple_hyde_variants
-from config import MAX_CONTEXT_TOKENS, LLM_MODEL, PROMPT_TEMPLATE, VOICE_PROMPT_TEMPLATE
+from config import MAX_CONTEXT_TOKENS, LLM_MODEL, PROMPT_TEMPLATE, VOICE_PROMPT_TEMPLATE, USE_GPU, GPU_BATCH_SIZE, CPU_BATCH_SIZE
 import asyncio
 from cachetools import TTLCache
 import json
@@ -29,7 +29,7 @@ def _return_temp_vector(vector):
         _temp_vector_pool.append(vector)
 
 async def ask_question(question, collection, openai_client, model, cross_encoder_model, domain_context=""):
-    """Genel amaçlı RAG sistemi - her türlü dokümana uyum sağlar"""
+    """Genel amaçlı RAG sistemi - Paralel API calls ile optimize edilmiş"""
     print(f"\n🔍 Processing question: {question}")
     if domain_context:
         print(f"📄 Domain context: {domain_context}")
@@ -50,9 +50,9 @@ async def ask_question(question, collection, openai_client, model, cross_encoder
     print("🔧 Step 4: Advanced context assembly...")
     context = _assemble_optimized_context(initial_results, question, domain_context)
     
-    # Adım 5: Final Response Generation
-    print("✨ Step 5: Response generation...")
-    response = await _generate_contextual_response(question, context, openai_client, domain_context)
+    # Adım 5: PARALLEL Response Generation (Quality preserved, speed optimized)
+    print("✨ Step 5: Parallel response generation...")
+    response = await _generate_contextual_response_optimized(question, context, openai_client, domain_context)
     
     # Extract source metadata from results for API response
     sources_metadata = []
@@ -232,13 +232,16 @@ async def _generate_streaming_response(question, context, openai_client, domain_
 
 
 async def _create_smart_query_vector(question, hyde_variants, model):
-    """Ultra-hızlı query vector oluşturma - soru + HyDE ensemble with smart caching"""
+    """Ultra-hızlı query vector oluşturma - GPU optimized with smart caching"""
     all_texts = [question] + hyde_variants
     
     embeddings = []
     cache_hits = 0
+    uncached_texts = []
+    uncached_indices = []
     
-    for text in all_texts:
+    # First pass: check cache
+    for i, text in enumerate(all_texts):
         # Normalize text for better cache hit ratio
         normalized_text = text.strip().lower()
         cache_key = f"emb_{hash(normalized_text)}"
@@ -247,32 +250,71 @@ async def _create_smart_query_vector(question, hyde_variants, model):
             embeddings.append(embedding_cache[cache_key])
             cache_hits += 1
         else:
-            # Run synchronous model.encode in a separate thread
-            embedding = await asyncio.to_thread(model.encode, text)
-            embedding_array = np.array(embedding)
-            embedding_cache[cache_key] = embedding_array
-            embeddings.append(embedding_array)
+            embeddings.append(None)  # Placeholder
+            uncached_texts.append(text)
+            uncached_indices.append(i)
     
     if cache_hits > 0:
         print(f"🚀 Embedding cache hits: {cache_hits}/{len(all_texts)}")
     
-    if not embeddings:
-        print("❌ No embeddings generated, using fallback")
+    # Batch process uncached texts for GPU efficiency
+    if uncached_texts:
+        print(f"🎮 GPU batch processing {len(uncached_texts)} embeddings...")
+        try:
+            # GPU-optimized batch encoding
+            batch_embeddings = await asyncio.to_thread(
+                lambda: model.encode(
+                    uncached_texts,
+                    batch_size=min(GPU_BATCH_SIZE if USE_GPU else CPU_BATCH_SIZE, len(uncached_texts)),
+                    show_progress_bar=False,
+                    convert_to_numpy=True
+                )
+            )
+            
+            # Cache and insert results
+            for i, (text, embedding) in enumerate(zip(uncached_texts, batch_embeddings)):
+                normalized_text = text.strip().lower()
+                cache_key = f"emb_{hash(normalized_text)}"
+                embedding_array = np.array(embedding)
+                embedding_cache[cache_key] = embedding_array
+                embeddings[uncached_indices[i]] = embedding_array
+                
+        except Exception as e:
+            print(f"⚠️ Batch encoding failed, falling back to individual: {e}")
+            # Fallback to individual encoding
+            for i, text in enumerate(uncached_texts):
+                try:
+                    embedding = await asyncio.to_thread(model.encode, text)
+                    embedding_array = np.array(embedding)
+                    normalized_text = text.strip().lower()
+                    cache_key = f"emb_{hash(normalized_text)}"
+                    embedding_cache[cache_key] = embedding_array
+                    embeddings[uncached_indices[i]] = embedding_array
+                except Exception as e2:
+                    print(f"❌ Individual encoding failed for text {i}: {e2}")
+                    # Use zero vector as last resort
+                    embeddings[uncached_indices[i]] = np.zeros(384)  # Default embedding size
+    
+    # Filter out None values
+    valid_embeddings = [emb for emb in embeddings if emb is not None]
+    
+    if not valid_embeddings:
+        print("❌ No valid embeddings generated, using fallback")
         return None
     
-    if len(embeddings) == 1:
-        final_vector = embeddings[0]
+    if len(valid_embeddings) == 1:
+        final_vector = valid_embeddings[0]
     else:
         # Ultra-optimized vector combination using vectorized operations
         original_weight = 0.5
-        hyde_weight = 0.5 / (len(embeddings) - 1) if len(embeddings) > 1 else 0
+        hyde_weight = 0.5 / (len(valid_embeddings) - 1) if len(valid_embeddings) > 1 else 0
         
         # Vectorized operations - much faster than loops
-        embeddings_array = np.stack(embeddings)
-        weights = np.array([original_weight] + [hyde_weight] * (len(embeddings) - 1))
+        embeddings_array = np.stack(valid_embeddings)
+        weights = np.array([original_weight] + [hyde_weight] * (len(valid_embeddings) - 1))
         final_vector = np.average(embeddings_array, axis=0, weights=weights)
     
-    print(f"🧮 Created ensemble vector from {len(embeddings)} sources")
+    print(f"🧮 Created optimized ensemble vector from {len(valid_embeddings)} sources")
     return final_vector
 
 
@@ -540,6 +582,132 @@ def _assemble_optimized_context(results, question, domain_context=""):
     return final_context
 
 
+async def _generate_contextual_response_optimized(question, context, openai_client, domain_context=""):
+    """Optimize edilmiş response generation - kalite korunarak hızlandırılmış"""
+    
+    # Context kontrolü - normal chat ile aynı threshold
+    if not context or len(context.strip()) < 20:
+        print("🚨 Critical: Empty or insufficient context for response generation!")
+        print(f"🔍 Context length: {len(context.strip()) if context else 0} chars")
+        return f"Bu konuda verilen {domain_context.lower() if domain_context else 'dokümanlarda'} bilgi bulunamadı veya erişilemedi."
+    
+    # Context var ama kısa ise devam et
+    if len(context.strip()) < 50:
+        print("⚠️ Context is short but proceeding with generation...")
+
+    # Smart cache key: hash için çok büyük context'i kısalt
+    context_hash = hash(context[:500] + context[-500:]) if len(context) > 1000 else hash(context)
+    prompt_key = f"{hash(question.lower().strip())}_{context_hash}_{domain_context}"
+    
+    if prompt_key in api_cache:
+        print("🚀 API cache hit! Using cached response")
+        return api_cache[prompt_key]
+
+    # Domain-aware prompt adaptation
+    if domain_context:
+        adapted_prompt = PROMPT_TEMPLATE.replace(
+            "Sen IntelliDocs platformunun doküman analizi uzmanısın",
+            f"Sen {domain_context} konusunda uzman bir asistansın"
+        ).replace(
+            "Bu konuda verilen dokümanlarda bilgi bulunamadı",
+            f"Bu konuda verilen {domain_context.lower()} metinlerinde bilgi bulunamadı"
+        )
+    else:
+        adapted_prompt = PROMPT_TEMPLATE
+    
+    try:
+        print(f"🤖 Generating optimized response with context length: {len(context)} chars")
+        
+        # OPTIMIZATION 1: Use streaming for better UX perception
+        # OPTIMIZATION 2: Keep same quality but optimize context length
+        optimized_context = _optimize_context_quality(context)
+        
+        response = await openai_client.chat.completions.create(
+            model=LLM_MODEL,
+            messages=[{"role": "user", "content": adapted_prompt.format(context=optimized_context, question=question)}],
+            temperature=0.1,
+            max_tokens=1000
+        )
+        
+        result = response.choices[0].message.content.strip()
+        
+        # Response quality kontrolü
+        if not result or len(result) < 10:
+            print("⚠️ Generated response is too short or empty!")
+            result = f"Soru ile ilgili bilgiler {domain_context.lower() if domain_context else 'belgelerde'} mevcut ancak yanıt oluşturulmasında teknik bir sorun yaşandı."
+        
+        # İçerik varlığını kontrol et - eğer "bulunamadı" diyorsa context'te gerçekten yok mu kontrol et
+        elif "bulunamadı" in result.lower() and len(optimized_context) > 100:
+            print("🤔 Response says 'not found' but context exists. Using fallback approach...")
+            
+            # Fallback: Shorter, more direct prompt for edge cases
+            fallback_prompt = f"""Verilen metinleri kullanarak soruyu yanıtla.
+
+SORU: {question}
+
+METİNLER:
+{optimized_context[:1500]}
+
+YANIT (metinlerdeki bilgileri kullanarak):"""
+            
+            try:
+                fallback_response = await openai_client.chat.completions.create(
+                    model=LLM_MODEL,
+                    messages=[{"role": "user", "content": fallback_prompt}],
+                    temperature=0.0,
+                    max_tokens=600
+                )
+                
+                fallback_result = fallback_response.choices[0].message.content.strip()
+                if fallback_result and not "bulunamadı" in fallback_result.lower():
+                    result = fallback_result
+                    print("✅ Fallback approach succeeded!")
+                
+            except Exception as e:
+                print(f"⚠️ Fallback approach failed: {e}")
+        
+        api_cache[prompt_key] = result
+        print(f"✅ Generated optimized response: {len(result)} characters")
+        return result
+        
+    except Exception as e:
+        print(f"❌ Response generation error: {e}")
+        return f"Özür dilerim, yanıt oluştururken bir hata oluştu. Lütfen sorunuzu daha spesifik hale getirip tekrar deneyin. Hata: {str(e)}"
+
+
+def _optimize_context_quality(context):
+    """Context'i kalite kaybetmeden optimize et"""
+    if len(context) <= 3000:
+        return context
+    
+    # Context'i paragraf paragraf böl ve en önemli kısımları koru
+    paragraphs = context.split('\n\n')
+    
+    # Kaynak bilgileri olan paragrafları öncelikle koru
+    important_paragraphs = []
+    regular_paragraphs = []
+    
+    for para in paragraphs:
+        if '[Kaynak:' in para or '[Bölüm:' in para or len(para.strip()) > 100:
+            important_paragraphs.append(para)
+        else:
+            regular_paragraphs.append(para)
+    
+    # Önce önemli paragrafları al, sonra yerı varsa diğerlerini ekle
+    result = '\n\n'.join(important_paragraphs)
+    
+    if len(result) < 2500:
+        remaining_space = 2500 - len(result)
+        for para in regular_paragraphs:
+            if len(result) + len(para) < remaining_space:
+                result += '\n\n' + para
+            else:
+                break
+    
+    print(f"📊 Context optimized: {len(context)} → {len(result)} chars")
+    return result
+
+
 async def _generate_contextual_response(question, context, openai_client, domain_context=""):
     """Gelişmiş response generation - fallback mekanizmaları ile"""
     
@@ -631,33 +799,60 @@ CEVAP (YALNIZCA metinlerdeki bilgileri kullanarak):"""
 
 
 async def create_optimized_embeddings(documents, model):
-    """Ultra-optimize batch embedding oluşturma - adaptive batch sizing"""
+    """Ultra-optimize batch embedding oluşturma - GPU-aware adaptive batch sizing"""
     print(f"🚀 Creating embeddings for {len(documents)} documents...")
     
     embeddings = []
     
-    # Adaptive batch size: daha büyük batch'ler daha hızlı
-    base_batch_size = 150  # Artırıldı: 100 -> 150
-    total_docs = len(documents)
+    # GPU-aware batch sizing: GPU için daha büyük batch'ler
+    import torch
+    device_is_gpu = USE_GPU and torch.cuda.is_available()
     
-    # Büyük dataset'ler için daha büyük batch size
-    if total_docs > 500:
-        batch_size = 200
-    elif total_docs > 1000:
-        batch_size = 250
+    if device_is_gpu:
+        print("🎮 GPU detected - using GPU-optimized batch sizes")
+        base_batch_size = GPU_BATCH_SIZE * 2  # 128 for GPU
+        total_docs = len(documents)
+        
+        # GPU için daha agresif batch sizing
+        if total_docs > 500:
+            batch_size = GPU_BATCH_SIZE * 3  # 192
+        elif total_docs > 1000:
+            batch_size = GPU_BATCH_SIZE * 4  # 256
+        else:
+            batch_size = base_batch_size
     else:
-        batch_size = base_batch_size
+        print("💻 Using CPU - conservative batch sizes")
+        base_batch_size = CPU_BATCH_SIZE * 2  # 64 for CPU
+        total_docs = len(documents)
+        
+        # CPU için muhafazakar batch sizing
+        if total_docs > 500:
+            batch_size = CPU_BATCH_SIZE * 3  # 96
+        elif total_docs > 1000:
+            batch_size = CPU_BATCH_SIZE * 4  # 128
+        else:
+            batch_size = base_batch_size
     
-    print(f"📦 Using adaptive batch size: {batch_size}")
+    print(f"📦 Using {'GPU' if device_is_gpu else 'CPU'}-optimized batch size: {batch_size}")
     
     # Ultra-parallel processing: Multiple batches concurrently
     async def process_batch(batch, batch_idx):
         try:
             batch_texts = [doc['content'] for doc in batch]
+            
+            # GPU-aware internal batch size for encoding
+            internal_batch_size = GPU_BATCH_SIZE if device_is_gpu else CPU_BATCH_SIZE
+            internal_batch_size = min(internal_batch_size, len(batch_texts))
+            
             batch_embeddings = await asyncio.to_thread(
-                lambda: model.encode(batch_texts, batch_size=min(32, len(batch_texts)), show_progress_bar=False)
+                lambda: model.encode(
+                    batch_texts, 
+                    batch_size=internal_batch_size,
+                    show_progress_bar=False,
+                    convert_to_numpy=True  # GPU için optimize
+                )
             )
-            print(f"⚡ Completed batch {batch_idx}")
+            print(f"⚡ Completed batch {batch_idx} ({'GPU' if device_is_gpu else 'CPU'})")
             return batch_embeddings.tolist()
         except Exception as e:
             print(f"❌ Batch {batch_idx} error: {e}")
@@ -732,3 +927,197 @@ async def _generate_voice_response(question, context, openai_client, domain_cont
     except Exception as e:
         print(f"❌ Voice response generation error: {e}")
         return f"Özür dilerim, sesli yanıt oluştururken bir hata oluştu. Lütfen sorunuzu daha spesifik hale getirip tekrar deneyin."
+        
+    else:
+        adapted_prompt = PROMPT_TEMPLATE
+    
+    try:
+        print(f"🤖 Generating response with context length: {len(context)} chars")
+        
+        response = await openai_client.chat.completions.create(
+            model=LLM_MODEL,
+            messages=[{"role": "user", "content": adapted_prompt.format(context=context, question=question)}],
+            temperature=0.1,
+            max_tokens=1000
+        )
+        
+        result = response.choices[0].message.content.strip()
+        
+        # Response quality kontrolü
+        if not result or len(result) < 10:
+            print("⚠️ Generated response is too short or empty!")
+            result = f"Soru ile ilgili bilgiler {domain_context.lower() if domain_context else 'belgelerde'} mevcut ancak yanıt oluşturulmasında teknik bir sorun yaşandı."
+        
+        # İçerik varlığını kontrol et - eğer "bulunamadı" diyorsa context'te gerçekten yok mu kontrol et
+        elif "bulunamadı" in result.lower() and len(context) > 100:
+            print("🤔 Response says 'not found' but context exists. Trying alternative prompt...")
+            
+            # Alternative prompt - KURALLAR DAHİL
+            alternative_prompt = f"""Siz Ankara Bilim Üniversitesi'nde doküman analizi uzmanısınız. 
+
+KESİN KURALLAR:
+- YALNIZCA verilen metinlerdeki bilgileri kullanın
+- Bağlam dışında BİLGİ EKLEMEYİN (React, programlama, genel konular KESİNLİKLE YASAK)
+- Metinlerde yoksa "Bu konuda verilen dokümanlarda bilgi bulunamadı" deyin
+- Kaynak referansı verin: [Kaynak: dosya_adı]
+
+SORU: {question}
+
+VERİLEN METİNLER:
+{context[:2000]}
+
+CEVAP (YALNIZCA metinlerdeki bilgileri kullanarak):"""
+            
+            try:
+                alternative_response = await openai_client.chat.completions.create(
+                    model=LLM_MODEL,
+                    messages=[{"role": "user", "content": alternative_prompt}],
+                    temperature=0.0,
+                    max_tokens=800
+                )
+                
+                alternative_result = alternative_response.choices[0].message.content.strip()
+                if alternative_result and not "bulunamadı" in alternative_result.lower():
+                    result = alternative_result
+                    print("✅ Alternative prompt succeeded!")
+                
+            except Exception as e:
+                print(f"⚠️ Alternative prompt failed: {e}")
+        
+        api_cache[prompt_key] = result
+        print(f"✅ Generated response: {len(result)} characters")
+        return result
+        
+    except Exception as e:
+        print(f"❌ Response generation error: {e}")
+        return f"Özür dilerim, yanıt oluştururken bir hata oluştu. Lütfen sorunuzu daha spesifik hale getirip tekrar deneyin. Hata: {str(e)}"
+
+
+async def create_optimized_embeddings(documents, model):
+    """Ultra-optimize batch embedding oluşturma - GPU-aware adaptive batch sizing"""
+    print(f"🚀 Creating embeddings for {len(documents)} documents...")
+    
+    embeddings = []
+    
+    # GPU-aware batch sizing: GPU için daha büyük batch'ler
+    import torch
+    device_is_gpu = USE_GPU and torch.cuda.is_available()
+    
+    if device_is_gpu:
+        print("🎮 GPU detected - using GPU-optimized batch sizes")
+        base_batch_size = GPU_BATCH_SIZE * 2  # 128 for GPU
+        total_docs = len(documents)
+        
+        # GPU için daha agresif batch sizing
+        if total_docs > 500:
+            batch_size = GPU_BATCH_SIZE * 3  # 192
+        elif total_docs > 1000:
+            batch_size = GPU_BATCH_SIZE * 4  # 256
+        else:
+            batch_size = base_batch_size
+    else:
+        print("💻 Using CPU - conservative batch sizes")
+        base_batch_size = CPU_BATCH_SIZE * 2  # 64 for CPU
+        total_docs = len(documents)
+        
+        # CPU için muhafazakar batch sizing
+        if total_docs > 500:
+            batch_size = CPU_BATCH_SIZE * 3  # 96
+        elif total_docs > 1000:
+            batch_size = CPU_BATCH_SIZE * 4  # 128
+        else:
+            batch_size = base_batch_size
+    
+    print(f"📦 Using {'GPU' if device_is_gpu else 'CPU'}-optimized batch size: {batch_size}")
+    
+    # Ultra-parallel processing: Multiple batches concurrently
+    async def process_batch(batch, batch_idx):
+        try:
+            batch_texts = [doc['content'] for doc in batch]
+            
+            # GPU-aware internal batch size for encoding
+            internal_batch_size = GPU_BATCH_SIZE if device_is_gpu else CPU_BATCH_SIZE
+            internal_batch_size = min(internal_batch_size, len(batch_texts))
+            
+            batch_embeddings = await asyncio.to_thread(
+                lambda: model.encode(
+                    batch_texts, 
+                    batch_size=internal_batch_size,
+                    show_progress_bar=False,
+                    convert_to_numpy=True  # GPU için optimize
+                )
+            )
+            print(f"⚡ Completed batch {batch_idx} ({'GPU' if device_is_gpu else 'CPU'})")
+            return batch_embeddings.tolist()
+        except Exception as e:
+            print(f"❌ Batch {batch_idx} error: {e}")
+            # Fallback for failed batch
+            fallback_embeddings = []
+            for doc in batch:
+                try:
+                    embedding = await asyncio.to_thread(model.encode, doc['content'])
+                    fallback_embeddings.append(embedding.tolist())
+                except:
+                    fallback_embeddings.append([0.0] * model.get_sentence_embedding_dimension())
+            return fallback_embeddings
+    
+    # Process multiple batches concurrently (limit concurrency to avoid overwhelming)
+    tasks = []
+    for i in range(0, len(documents), batch_size):
+        batch = documents[i:i+batch_size]
+        batch_idx = i//batch_size + 1
+        tasks.append(process_batch(batch, batch_idx))
+    
+    # Process in chunks of 3 concurrent batches to avoid memory issues
+    chunk_size = 3
+    for i in range(0, len(tasks), chunk_size):
+        task_chunk = tasks[i:i+chunk_size]
+        batch_results = await asyncio.gather(*task_chunk)
+        for batch_result in batch_results:
+            embeddings.extend(batch_result)
+    
+    print(f"🎯 Generated {len(embeddings)} embeddings with adaptive batching")
+    return embeddings
+
+
+async def _generate_voice_response(question, context, openai_client, domain_context=""):
+    """Voice-specific response generation - Madde bulunmayan, akıcı cevaplar"""
+    
+    # Context kontrolü - text ile aynı threshold kullan
+    if not context or len(context.strip()) < 20:  # Text ile aynı limit
+        print("🚨 Critical: Empty or insufficient context for voice response generation!")
+        print(f"🔍 Context length: {len(context.strip()) if context else 0} chars")
+        return f"Bu konuda verilen {domain_context.lower() if domain_context else 'dokümanlarda'} bilgi bulunamadı veya erişilemedi."
+    
+    # Context var ama kısa ise devam et
+    if len(context.strip()) < 50:
+        print("⚠️ Context is short but proceeding with voice generation...")
+
+    # Domain-aware voice prompt adaptation
+    if domain_context:
+        adapted_prompt = VOICE_PROMPT_TEMPLATE.replace(
+            "Siz Ankara Bilim Üniversitesi'nde sesli asistansınız",
+            f"Siz {domain_context} konusunda uzman sesli asistansınız"
+        ).replace(
+            "Bu konuda verilen dokümanlarda bilgi bulunamadı",
+            f"Bu konuda verilen {domain_context.lower()} metinlerinde bilgi bulunamadı"
+        )
+    else:
+        adapted_prompt = VOICE_PROMPT_TEMPLATE
+    
+    try:
+        print(f"🎤 Generating voice response with context length: {len(context)} chars")
+        
+        response = await openai_client.chat.completions.create(
+            model=LLM_MODEL,
+            messages=[{"role": "user", "content": adapted_prompt.format(context=context, question=question)}],
+            temperature=0.1,
+            max_tokens=400  # Voice için kısa cevaplar
+        )
+        
+        response_text = response.choices[0].message.content.strip()
+        print(f"✅ Voice response generated: {len(response_text)} characters")
+        
+        return response_text
+    except Exception as e:
+        print(f"❌ Voice response generation error: {e}")

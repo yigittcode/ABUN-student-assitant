@@ -14,7 +14,7 @@ from tqdm import tqdm
 # Import our modules
 from config import (
     MONGODB_URL, MONGODB_DB_NAME, WEAVIATE_HOST, WEAVIATE_PORT, WEAVIATE_GRPC_PORT,
-    EMBEDDING_MODEL, DOCUMENTS_DIRECTORY
+    EMBEDDING_MODEL, DOCUMENTS_DIRECTORY, USE_GPU
 )
 from mongodb_manager import MongoDBManager
 from document_processor import load_and_process_documents
@@ -33,9 +33,16 @@ def migrate_existing_documents():
         print("📡 Connecting to MongoDB Atlas...")
         mongodb_manager = MongoDBManager(MONGODB_URL, MONGODB_DB_NAME)
         
-        # Initialize embedding model
+        # Initialize embedding model with GPU support
+        import torch
+        device = "cuda" if USE_GPU and torch.cuda.is_available() else "cpu"
+        print(f"🎮 Using device: {device}")
+        
+        if device == "cuda":
+            print(f"🚀 GPU detected: {torch.cuda.get_device_name(0)}")
+        
         print(f"🤖 Loading embedding model: {EMBEDDING_MODEL}")
-        embedding_model = SentenceTransformer(EMBEDDING_MODEL)
+        embedding_model = SentenceTransformer(EMBEDDING_MODEL, device=device)
         
         # Initialize Weaviate client
         print("🗄️ Connecting to Weaviate...")
@@ -262,3 +269,9 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"\n❌ Migration failed: {e}")
         exit(1)
+        print("🔄 You can now use the new API backend (api_backend_v2.py)")
+        
+    except KeyboardInterrupt:
+        print("\n⏸️ Migration interrupted by user")
+    except Exception as e:
+        print(f"\n❌ Migration failed: {e}")

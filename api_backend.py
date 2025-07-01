@@ -28,7 +28,8 @@ from config import (
     OPENAI_API_KEY, WEAVIATE_HOST, WEAVIATE_PORT, WEAVIATE_GRPC_PORT,
     COLLECTION_NAME, EMBEDDING_MODEL, CROSS_ENCODER_MODEL,
     MONGODB_URL, MONGODB_DB_NAME, MONGODB_COLLECTION_NAME, JWT_SECRET_KEY, JWT_ALGORITHM, 
-    JWT_EXPIRE_MINUTES, ADMIN_EMAIL, ADMIN_PASSWORD, PERSISTENT_COLLECTION_NAME
+    JWT_EXPIRE_MINUTES, ADMIN_EMAIL, ADMIN_PASSWORD, PERSISTENT_COLLECTION_NAME,
+    USE_GPU, GPU_DEVICE, GPU_BATCH_SIZE, CPU_BATCH_SIZE
 )
 from rag_engine import ask_question, ask_question_stream, ask_question_voice, create_optimized_embeddings
 from document_processor import load_and_process_documents
@@ -168,12 +169,35 @@ async def lifespan(app: FastAPI):
         # Startup: Load models and initialize connections
         logger.info("🚀 Starting IntelliDocs API Backend v2.0...")
         
-        # Load AI models
+        # Load AI models with GPU support and memory optimization
+        import torch
+        device = "cuda" if USE_GPU and torch.cuda.is_available() else "cpu"
+        logger.info(f"🎮 Using device: {device}")
+        
+        if device == "cuda":
+            logger.info(f"🚀 GPU detected: {torch.cuda.get_device_name(0)}")
+            logger.info(f"🔋 GPU memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
+            
+            # GPU Memory optimization
+            logger.info("🧹 Clearing GPU cache for optimal loading...")
+            torch.cuda.empty_cache()
+            
+            # Set memory growth for better management
+            if hasattr(torch.cuda, 'set_memory_fraction'):
+                torch.cuda.set_memory_fraction(0.8)  # Use 80% of GPU memory max
+        
         logger.info(f"Loading Bi-Encoder model: {EMBEDDING_MODEL}")
-        embedding_model = SentenceTransformer(EMBEDDING_MODEL)
+        embedding_model = SentenceTransformer(EMBEDDING_MODEL, device=device)
+        
+        if device == "cuda":
+            logger.info(f"🔋 Memory after embedding model: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
         
         logger.info(f"Loading Cross-Encoder model: {CROSS_ENCODER_MODEL}")
-        cross_encoder_model = CrossEncoder(CROSS_ENCODER_MODEL)
+        cross_encoder_model = CrossEncoder(CROSS_ENCODER_MODEL, device=device)
+        
+        if device == "cuda":
+            logger.info(f"🔋 Total GPU memory used: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
+            logger.info(f"🔋 GPU memory cached: {torch.cuda.memory_reserved() / 1024**3:.2f} GB")
         
         # Initialize OpenAI client
         logger.info("Initializing OpenAI client...")
@@ -285,7 +309,7 @@ async def root():
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint"""
+    """Health check endpoint with GPU information"""
     global weaviate_client, embedding_model, cross_encoder_model, openai_client, mongodb_manager, speech_processor
     
     try:
@@ -295,6 +319,22 @@ async def health_check():
         
         # Get database stats
         db_stats = mongodb_manager.get_database_stats()
+        
+        # Get GPU information
+        import torch
+        gpu_info = {
+            "gpu_available": torch.cuda.is_available(),
+            "gpu_enabled": USE_GPU,
+            "device": "cuda" if USE_GPU and torch.cuda.is_available() else "cpu"
+        }
+        
+        if gpu_info["gpu_available"]:
+            gpu_info.update({
+                "gpu_name": torch.cuda.get_device_name(0),
+                "gpu_memory_total": f"{torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB",
+                "gpu_memory_allocated": f"{torch.cuda.memory_allocated() / 1024**3:.2f} GB",
+                "gpu_memory_cached": f"{torch.cuda.memory_reserved() / 1024**3:.2f} GB"
+            })
         
         return {
             "status": "healthy",
@@ -307,6 +347,7 @@ async def health_check():
                 "mongodb": "connected",
                 "speech_processor": "loaded" if speech_processor else "not loaded"
             },
+            "gpu_info": gpu_info,
             "database_stats": db_stats
         }
     except Exception as e:
@@ -1266,6 +1307,47 @@ async def text_to_speech_endpoint(
         
         # Ses dosyasını döndür
         from fastapi.responses import FileResponse
+        try:
+            return FileResponse(
+                audio_path,
+                media_type="audio/mpeg", 
+                filename="response.mp3",
+                headers={"Cache-Control": "no-cache"}
+            )
+        except (ConnectionResetError, BrokenPipeError):
+            logger.info("🚪 Connection broken while sending response")
+            raise HTTPException(status_code=499, detail="Connection broken")
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Text-to-Speech error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/speech/voices")
+async def get_speech_voices():
+    """Mevcut sesleri listele"""
+    global speech_processor
+    
+    return {
+        "voices": speech_processor.get_available_voices() if speech_processor else {},
+        "default": "tr-TR-EmelNeural"
+    }
+
+if __name__ == "__main__":
+    print("🚀 Starting IntelliDocs API Backend v2.0...")
+    print("📚 Advanced RAG API with persistent document storage")
+    print("🔗 API will be available at: http://localhost:8000")
+    print("📖 API Documentation: http://localhost:8000/docs")
+    
+    uvicorn.run(
+        "api_backend:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=True,
+        log_level="info"
+    )
+
         try:
             return FileResponse(
                 audio_path,

@@ -103,63 +103,97 @@ class AdvancedHydeGenerator:
 
 
 async def generate_enhanced_hyde(question, client, domain_context=""):
-    """Gelişmiş HyDE: Direkt referanslar ve karmaşık senaryolar için optimize"""
+    """Gelişmiş HyDE: Kalite korunarak hızlandırılmış"""
     
-    # Kategori ve dil tespit et
+    # OPTIMIZATION 1: Smart HyDE caching
+    hyde_cache_key = f"hyde_{hash(question.lower().strip())}_{domain_context}"
+    
+    # Check cache first
+    from rag_engine import api_cache
+    if hyde_cache_key in api_cache:
+        print("🚀 HyDE cache hit! Using cached result")
+        return api_cache[hyde_cache_key]
+    
+    # OPTIMIZATION 2: Smart category detection - skip complex analysis for simple questions
+    simple_patterns = ['nedir', 'what is', 'kimdir', 'neler']
+    is_simple = any(pattern in question.lower() for pattern in simple_patterns)
+    
+    if is_simple and len(question.split()) <= 5:
+        # For simple questions, skip HyDE and use question directly
+        print("⚡ Simple question detected - skipping HyDE for speed")
+        result = [question]
+        api_cache[hyde_cache_key] = result
+        return result
+    
+    # For complex questions, use optimized HyDE
     generator = AdvancedHydeGenerator()
     category = generator.detect_category(question)
     language = generator.detect_language(question)
     
-    # Prompt oluştur
+    # OPTIMIZATION 3: Shorter, more focused prompts for speed
     config = generator.ENHANCED_CATEGORIES[category]
     prompt_key = 'prompt_tr' if language == 'turkish' else 'prompt_en'
     base_prompt = config[prompt_key]
     
-    # Domain context ekle
+    # Domain context ekle (optimized)
     if domain_context:
         if language == 'turkish':
-            context_prompt = f"[Bağlam: {domain_context}] "
+            context_prompt = f"[{domain_context}] "
         else:
-            context_prompt = f"[Context: {domain_context}] "
+            context_prompt = f"[{domain_context}] "
         base_prompt = context_prompt + base_prompt
-    else:
-        base_prompt = base_prompt
     
     # Direkt referans kategori ise özel yaklaşım
     if category == 'direct_reference':
-        # Extract reference number/name
         ref_match = re.search(r'madde\s*(\d+)', question.lower())
         if ref_match:
             ref_num = ref_match.group(1)
-            base_prompt += f"\n\nÖzellikle MADDE {ref_num} ile ilgili tüm detayları dahil et."
+            base_prompt += f" MADDE {ref_num} odaklı yanıt."
     
-    # Senaryo kategori ise özel yaklaşım
-    elif category == 'scenario_based':
-        base_prompt += "\n\nBu senaryoda geçerli olan tüm kuralları ve prosedürleri dahil et."
+    # OPTIMIZATION 4: Shorter prompt for faster generation
+    final_prompt = f"{base_prompt}\n\nSoru: {question}\n\nKısa yanıt:"
     
-    # Final prompt
-    final_prompt = f"{base_prompt}\n\nSoru: {question}\n\nYanıt:"
-    
-    print(f"🚀 Enhanced HyDE - Category: {category}, Language: {language}")
+    print(f"🚀 Optimized HyDE - Category: {category}, Simple: {is_simple}")
     
     try:
         response = await client.chat.completions.create(
             model=HYDE_LLM_MODEL, 
             messages=[{"role": "user", "content": final_prompt}],
             temperature=0.1, 
-            max_tokens=300  # Biraz artırdık karmaşık sorular için
+            max_tokens=150  # Reduced for speed: 300→150
         )
         
         hyde_answer = response.choices[0].message.content.strip()
-        print(f"✅ Generated enhanced HyDE: {hyde_answer[:80]}...")
+        print(f"✅ Generated optimized HyDE: {hyde_answer[:60]}...")
         
-        return [hyde_answer]  # Liste olarak döndür compatibility için
+        result = [hyde_answer] if hyde_answer else [question]
+        
+        # Cache the result
+        api_cache[hyde_cache_key] = result
+        
+        return result
     
     except Exception as e:
-        print(f"❌ Enhanced HyDE generation error: {e}")
+        print(f"❌ HyDE generation error: {e}")
         # Fallback: Soruyu direkt kullan
         print("🔄 Using question as fallback HyDE")
-        return [question]
+        fallback_result = [question]
+        api_cache[hyde_cache_key] = fallback_result
+        return fallback_result
+
+
+# Backward compatibility için - yeni gelişmiş sistemi kullan
+async def generate_multiple_hyde_variants(question, client, domain_context=""):
+    """Ana API - gelişmiş HyDE sistemi"""
+    return await generate_enhanced_hyde(question, client, domain_context)
+
+
+async def generate_hypothetical_answers(question, client, n=1, domain_context=""):
+    """Eski API ile uyumlu wrapper"""
+    result = await generate_enhanced_hyde(question, client, domain_context)
+    return result if result else [question]  # Fallback eklendi
+
+
 
 
 # Backward compatibility için - yeni gelişmiş sistemi kullan
