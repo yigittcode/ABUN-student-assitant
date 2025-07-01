@@ -33,7 +33,7 @@ from config import (
     USE_GPU, GPU_DEVICE, GPU_BATCH_SIZE, CPU_BATCH_SIZE, GPU_MAX_MEMORY_FRACTION,
     GPU_CONCURRENT_STREAMS, GPU_LARGE_BATCH_SIZE, GPU_EMBEDDING_BATCH_SIZE
 )
-from rag_engine import ask_question, ask_question_stream, ask_question_voice, create_optimized_embeddings, ask_question_optimized, ask_question_voice_optimized
+from rag_engine import ask_question, ask_question_stream, ask_question_voice, create_optimized_embeddings, ask_question_optimized, ask_question_voice_optimized, ask_question_with_memory, ask_question_with_memory_optimized, ask_question_voice_with_memory
 from document_processor import load_and_process_documents
 from mongodb_manager import MongoDBManager
 from speech_integration import SpeechProcessor
@@ -164,6 +164,29 @@ class DocumentDetails(BaseModel):
     chunks_count: int
     metadata: Dict[str, Any]
     weaviate_chunks: int
+
+# Add new models for memory-aware chat
+class ConversationChatMessage(BaseModel):
+    message: str
+    session_id: Optional[str] = None  # Optional for backward compatibility
+    start_new_conversation: bool = False
+
+class ConversationChatResponse(BaseModel):
+    response: str
+    sources: List[Dict[str, str]]
+    timestamp: str
+    session_id: str
+    message_count: int
+    is_new_conversation: bool
+
+class ConversationSession(BaseModel):
+    session_id: str
+    created_at: str
+    updated_at: str
+    message_count: int
+    status: str
+    first_message: str
+    last_message: str
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -690,6 +713,586 @@ async def chat_with_documents_stream(message: ChatMessage):
     except Exception as e:
         logger.error(f"❌ Error in streaming chat: {e}")
         raise HTTPException(status_code=500, detail=f"Error processing streaming question: {str(e)}")
+
+# =================== MEMORY-AWARE CHAT ENDPOINTS ===================
+
+@app.post("/api/chat/memory", response_model=ConversationChatResponse)
+async def chat_with_memory(message: ConversationChatMessage, request: Request):
+    """💭 Memory-aware chat with conversation history tracking - PUBLIC ACCESS"""
+    global weaviate_client, openai_client, embedding_model, cross_encoder_model, mongodb_manager
+    
+    try:
+        # Get persistent collection
+        if not weaviate_client.collections.exists(PERSISTENT_COLLECTION_NAME):
+            raise HTTPException(status_code=404, detail="No documents available for chat. Please upload documents first.")
+        
+        collection = weaviate_client.collections.get(PERSISTENT_COLLECTION_NAME)
+        
+        # Get user identifier for anonymous sessions (IP address)
+        client_ip = request.client.host
+        user_identifier = f"anon_{client_ip}"
+        
+        # Session management
+        session_id = message.session_id
+        is_new_conversation = False
+        
+        # 1. Determine session
+        if message.start_new_conversation or not session_id:
+            # Create new anonymous conversation session
+            session_id = mongodb_manager.create_anonymous_conversation_session(
+                initial_message=message.message,
+                user_identifier=user_identifier
+            )
+            is_new_conversation = True
+            conversation_context = ""
+            logger.info(f"💬 Created new anonymous conversation session: {session_id}")
+        else:
+            # Use existing session
+            session = mongodb_manager.get_conversation_session(session_id)
+            if not session:
+                # Session doesn't exist, create new one
+                session_id = mongodb_manager.create_anonymous_conversation_session(
+                    initial_message=message.message,
+                    user_identifier=user_identifier
+                )
+                is_new_conversation = True
+                conversation_context = ""
+                logger.info(f"💬 Session not found, created new anonymous one: {session_id}")
+            else:
+                # Get conversation context from existing session
+                conversation_context = mongodb_manager.get_recent_conversation_context(
+                    session_id=session_id,
+                    max_messages=10,
+                    max_tokens=2000
+                )
+                logger.info(f"💭 Using existing session: {session_id} with {len(conversation_context)} chars context")
+        
+        # 2. Process with SEMANTIC memory-aware RAG 
+        answer, sources_metadata = await ask_question_with_memory_optimized(
+            question=message.message.strip(),
+            collection=collection,
+            openai_client=openai_client,
+            model=embedding_model,
+            cross_encoder_model=cross_encoder_model,
+            conversation_context=conversation_context,
+            domain_context=""
+        )
+        
+        # 3. Store conversation message
+        message_id = mongodb_manager.store_conversation_message(
+            session_id=session_id,
+            question=message.message.strip(),
+            answer=answer,
+            sources=sources_metadata,
+            interaction_type="memory_chat_public"
+        )
+        
+        # 4. Get updated session info
+        session = mongodb_manager.get_conversation_session(session_id)
+        message_count = session.get("message_count", 1)
+        
+        return ConversationChatResponse(
+            response=answer,
+            sources=sources_metadata,
+            timestamp=datetime.now().isoformat(),
+            session_id=session_id,
+            message_count=message_count,
+            is_new_conversation=is_new_conversation
+        )
+        
+    except Exception as e:
+        logger.error(f"❌ Error in public memory-aware chat: {e}")
+        raise HTTPException(status_code=500, detail=f"Error processing memory-aware question: {str(e)}")
+
+@app.post("/api/chat/memory/stream")
+async def chat_with_memory_stream(message: ConversationChatMessage, request: Request):
+    """💭 Streaming memory-aware chat with conversation history - PUBLIC ACCESS"""
+    global weaviate_client, openai_client, embedding_model, cross_encoder_model, mongodb_manager
+    
+    try:
+        # Get persistent collection
+        if not weaviate_client.collections.exists(PERSISTENT_COLLECTION_NAME):
+            raise HTTPException(status_code=404, detail="No documents available for chat. Please upload documents first.")
+        
+        collection = weaviate_client.collections.get(PERSISTENT_COLLECTION_NAME)
+        
+        # Get user identifier for anonymous sessions (IP address)
+        client_ip = request.client.host
+        user_identifier = f"anon_{client_ip}"
+        
+        # Session management (same as above)
+        session_id = message.session_id
+        is_new_conversation = False
+        
+        if message.start_new_conversation or not session_id:
+            session_id = mongodb_manager.create_anonymous_conversation_session(
+                initial_message=message.message,
+                user_identifier=user_identifier
+            )
+            is_new_conversation = True
+            conversation_context = ""
+        else:
+            session = mongodb_manager.get_conversation_session(session_id)
+            if not session:
+                session_id = mongodb_manager.create_anonymous_conversation_session(
+                    initial_message=message.message,
+                    user_identifier=user_identifier
+                )
+                is_new_conversation = True
+                conversation_context = ""
+            else:
+                conversation_context = mongodb_manager.get_recent_conversation_context(
+                    session_id=session_id,
+                    max_messages=10,
+                    max_tokens=2000
+                )
+        
+        async def generate_memory_stream():
+            """Generate streaming response with memory"""
+            try:
+                # Use SEMANTIC memory-aware RAG (non-streaming, then simulate)
+                answer, sources_metadata = await ask_question_with_memory_optimized(
+                    question=message.message.strip(),
+                    collection=collection,
+                    openai_client=openai_client,
+                    model=embedding_model,
+                    cross_encoder_model=cross_encoder_model,
+                    conversation_context=conversation_context,
+                    domain_context=""
+                )
+                
+                # Simulate streaming
+                import json
+                import asyncio
+                
+                words = answer.split()
+                for i, word in enumerate(words):
+                    chunk_data = json.dumps({
+                        "type": "content",
+                        "content": word + (" " if i < len(words) - 1 else ""),
+                        "done": False
+                    })
+                    yield f"data: {chunk_data}\n\n"
+                    await asyncio.sleep(0.03)
+                
+                # Store conversation message
+                mongodb_manager.store_conversation_message(
+                    session_id=session_id,
+                    question=message.message.strip(),
+                    answer=answer,
+                    sources=sources_metadata,
+                    interaction_type="memory_stream_public"
+                )
+                
+                # Send completion with session info
+                session = mongodb_manager.get_conversation_session(session_id)
+                completion_data = {
+                    "type": "complete",
+                    "content": "",
+                    "done": True,
+                    "sources": sources_metadata,
+                    "full_response": answer,
+                    "session_id": session_id,
+                    "message_count": session.get("message_count", 1),
+                    "is_new_conversation": is_new_conversation,
+                    "timestamp": datetime.now().isoformat()
+                }
+                yield f"data: {json.dumps(completion_data)}\n\n"
+                yield f"data: [DONE]\n\n"
+                
+            except Exception as e:
+                logger.error(f"❌ Error in public memory streaming: {e}")
+                error_data = {
+                    "type": "error",
+                    "content": f"Hafızalı sohbet sırasında hata: {str(e)}",
+                    "done": True,
+                    "sources": []
+                }
+                yield f"data: {json.dumps(error_data)}\n\n"
+                yield f"data: [DONE]\n\n"
+        
+        return StreamingResponse(
+            generate_memory_stream(),
+            media_type="text/plain",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "Content-Type": "text/event-stream",
+            }
+        )
+        
+    except Exception as e:
+        logger.error(f"❌ Error in public memory streaming chat: {e}")
+        raise HTTPException(status_code=500, detail=f"Error processing memory streaming question: {str(e)}")
+
+# ADMIN-ONLY conversation endpoints (keep authentication)
+@app.get("/api/conversations", response_model=List[ConversationSession])
+async def get_user_conversations(token: AuthRequired, limit: int = 20):
+    """Get user's conversation sessions - ADMIN ONLY"""
+    global mongodb_manager
+    
+    try:
+        sessions = mongodb_manager.get_user_conversations(token, limit=limit)
+        
+        conversation_list = []
+        for session in sessions:
+            conversation_list.append(ConversationSession(
+                session_id=session["session_id"],
+                created_at=session["created_at"].isoformat(),
+                updated_at=session["updated_at"].isoformat(),
+                message_count=session.get("message_count", 0),
+                status=session.get("status", "active"),
+                first_message=session.get("first_message", "")[:100] + "..." if len(session.get("first_message", "")) > 100 else session.get("first_message", ""),
+                last_message=session.get("last_message", "")[:100] + "..." if len(session.get("last_message", "")) > 100 else session.get("last_message", "")
+            ))
+        
+        return conversation_list
+        
+    except Exception as e:
+        logger.error(f"❌ Error getting user conversations: {e}")
+        raise HTTPException(status_code=500, detail=f"Error retrieving conversations: {str(e)}")
+
+# PUBLIC conversation history endpoint (no auth needed if you have session_id)
+@app.get("/api/conversations/{session_id}/history")
+async def get_conversation_history(session_id: str, limit: int = 50):
+    """Get conversation history for a specific session - PUBLIC ACCESS"""
+    global mongodb_manager
+    
+    try:
+        # Get session (no auth needed, anyone with session_id can access)
+        session = mongodb_manager.get_conversation_session(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Conversation session not found")
+        
+        messages = mongodb_manager.get_conversation_history(session_id, limit=limit)
+        
+        # Format messages for response
+        formatted_messages = []
+        for msg in messages:
+            formatted_messages.append({
+                "message_id": msg["_id"],
+                "question": msg["question"],
+                "answer": msg["answer"],
+                "sources": msg["sources"],
+                "interaction_type": msg["interaction_type"],
+                "timestamp": msg["timestamp"].isoformat()
+            })
+        
+        return {
+            "session_id": session_id,
+            "message_count": len(formatted_messages),
+            "messages": formatted_messages
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Error getting conversation history: {e}")
+        raise HTTPException(status_code=500, detail=f"Error retrieving conversation history: {str(e)}")
+
+@app.post("/api/conversations/{session_id}/close")
+async def close_conversation(session_id: str, token: AuthRequired, summary: str = None):
+    """Close a conversation session - ADMIN ONLY"""
+    global mongodb_manager
+    
+    try:
+        # Verify session exists
+        session = mongodb_manager.get_conversation_session(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Conversation session not found")
+        
+        success = mongodb_manager.close_conversation_session(session_id, summary)
+        
+        if success:
+            return {
+                "status": "success",
+                "message": f"Conversation session {session_id} closed successfully",
+                "session_id": session_id
+            }
+        else:
+            raise HTTPException(status_code=500, detail="Failed to close conversation session")
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Error closing conversation: {e}")
+        raise HTTPException(status_code=500, detail=f"Error closing conversation: {str(e)}")
+
+@app.delete("/api/conversations")
+async def cleanup_conversations(token: AuthRequired, days_old: int = 30, inactive_days: int = 7):
+    """Clean up old conversation sessions - ADMIN ONLY"""
+    global mongodb_manager
+    
+    try:
+        stats = mongodb_manager.cleanup_old_sessions(days_old=days_old, inactive_days=inactive_days)
+        
+        return {
+            "status": "success",
+            "message": "Conversation cleanup completed",
+            "stats": stats
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Error cleaning up conversations: {e}")
+        raise HTTPException(status_code=500, detail=f"Error cleaning up conversations: {str(e)}")
+
+# USER session deletion endpoint - PUBLIC ACCESS with IP verification
+@app.delete("/api/conversations/{session_id}")
+async def delete_user_session(session_id: str, request: Request):
+    """Delete a specific conversation session - PUBLIC ACCESS (IP verified)"""
+    global mongodb_manager
+    
+    try:
+        # Get current user IP
+        client_ip = request.client.host
+        user_identifier = f"anon_{client_ip}"
+        
+        # Get session to verify ownership
+        session = mongodb_manager.get_conversation_session(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Conversation session not found")
+        
+        # Verify this IP owns the session
+        if session.get("user_email") != user_identifier:
+            raise HTTPException(status_code=403, detail="You can only delete your own sessions")
+        
+        # Delete the session and all its messages
+        success = mongodb_manager.delete_user_session(session_id)
+        
+        if success:
+            return {
+                "status": "success",
+                "message": f"Conversation session {session_id} deleted successfully",
+                "session_id": session_id
+            }
+        else:
+            raise HTTPException(status_code=500, detail="Failed to delete conversation session")
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Error deleting user session: {e}")
+        raise HTTPException(status_code=500, detail=f"Error deleting session: {str(e)}")
+
+# USER IP-based sessions listing - PUBLIC ACCESS
+@app.get("/api/my-conversations")  
+async def get_my_conversations(request: Request, limit: int = 20):
+    """Get current IP's conversation sessions - PUBLIC ACCESS"""
+    global mongodb_manager
+    
+    try:
+        # Get current user IP
+        client_ip = request.client.host
+        user_identifier = f"anon_{client_ip}"
+        
+        # Get sessions for this IP
+        sessions = mongodb_manager.get_user_sessions_by_identifier(user_identifier, limit=limit)
+        
+        conversation_list = []
+        for session in sessions:
+            conversation_list.append(ConversationSession(
+                session_id=session["session_id"],
+                created_at=session["created_at"].isoformat(),
+                updated_at=session["updated_at"].isoformat(),
+                message_count=session.get("message_count", 0),
+                status=session.get("status", "active"),
+                first_message=session.get("first_message", "")[:100] + "..." if len(session.get("first_message", "")) > 100 else session.get("first_message", ""),
+                last_message=session.get("last_message", "")[:100] + "..." if len(session.get("last_message", "")) > 100 else session.get("last_message", "")
+            ))
+        
+        return {
+            "ip_address": client_ip,
+            "total_sessions": len(conversation_list),
+            "sessions": conversation_list
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Error getting user conversations: {e}")
+        raise HTTPException(status_code=500, detail=f"Error retrieving your conversations: {str(e)}")
+
+# USER cleanup for IP - PUBLIC ACCESS  
+@app.delete("/api/my-conversations")
+async def delete_my_conversations(request: Request, confirm: bool = False):
+    """Delete ALL conversation sessions for current IP - PUBLIC ACCESS"""
+    global mongodb_manager
+    
+    try:
+        if not confirm:
+            raise HTTPException(status_code=400, detail="Please set confirm=true to delete all your conversations")
+        
+        # Get current user IP
+        client_ip = request.client.host
+        user_identifier = f"anon_{client_ip}"
+        
+        # Delete all sessions for this IP
+        deleted_count = mongodb_manager.delete_all_user_sessions(user_identifier)
+        
+        return {
+            "status": "success",
+            "message": f"Deleted {deleted_count} conversation sessions for IP {client_ip}",
+            "deleted_sessions": deleted_count,
+            "ip_address": client_ip
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Error deleting all user sessions: {e}")
+        raise HTTPException(status_code=500, detail=f"Error deleting your conversations: {str(e)}")
+
+# Voice + Memory endpoint - PUBLIC ACCESS
+@app.post("/api/speech-to-speech/memory")
+async def speech_to_speech_with_memory(
+    request: Request,
+    audio_file: UploadFile = File(...),
+    session_id: Optional[str] = Form(None),
+    start_new_conversation: bool = Form(False),
+    voice: str = Form("tr-TR-EmelNeural"),
+    gender: str = Form("female"),
+    language: str = Form("tr")
+):
+    """🎤💭 Memory-aware speech-to-speech with conversation tracking - PUBLIC ACCESS"""
+    global speech_processor, weaviate_client, openai_client, embedding_model, cross_encoder_model, mongodb_manager
+    
+    try:
+        # Voice selection logic (same as before)
+        if gender != "female":
+            selected_voice = speech_processor.get_voice_by_gender(gender)
+        else:
+            selected_voice = speech_processor.get_voice_by_gender(voice)
+        
+        # Get user identifier for anonymous sessions (IP address)
+        client_ip = request.client.host
+        user_identifier = f"anon_{client_ip}"
+        
+        logger.info(f"🎤💭 Public memory-aware voice processing - Voice: {selected_voice}, Session: {session_id}")
+        
+        # Check disconnection
+        if await request.is_disconnected():
+            logger.info("🚪 Client disconnected at start")
+            raise HTTPException(status_code=499, detail="Client disconnected")
+        
+        # STT: Audio to text
+        import tempfile
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as tmp_file:
+            shutil.copyfileobj(audio_file.file, tmp_file)
+            temp_audio_path = tmp_file.name
+            speech_processor.temp_files.append(temp_audio_path)
+        
+        logger.info("🎤 Speech-to-Text conversion...")
+        if await request.is_disconnected():
+            speech_processor.cleanup_temp_files()
+            raise HTTPException(status_code=499, detail="Client disconnected")
+        
+        recognized_text = await asyncio.to_thread(
+            speech_processor.speech_to_text, temp_audio_path, language
+        )
+        
+        if not recognized_text:
+            raise HTTPException(status_code=400, detail="Ses tanınamadı")
+        
+        logger.info(f"🎤 Recognized text: {recognized_text}")
+        
+        # Session management for voice (anonymous)
+        if start_new_conversation or not session_id:
+            session_id = mongodb_manager.create_anonymous_conversation_session(
+                initial_message=recognized_text,
+                user_identifier=user_identifier
+            )
+            conversation_context = ""
+            logger.info(f"💬🎤 Created new anonymous voice conversation session: {session_id}")
+        else:
+            session = mongodb_manager.get_conversation_session(session_id)
+            if not session:
+                session_id = mongodb_manager.create_anonymous_conversation_session(
+                    initial_message=recognized_text,
+                    user_identifier=user_identifier
+                )
+                conversation_context = ""
+            else:
+                conversation_context = mongodb_manager.get_recent_conversation_context(
+                    session_id=session_id,
+                    max_messages=8,  # Shorter for voice
+                    max_tokens=1500  # Less tokens for voice
+                )
+        
+        # Memory-aware RAG processing
+        if await request.is_disconnected():
+            speech_processor.cleanup_temp_files()
+            raise HTTPException(status_code=499, detail="Client disconnected")
+        
+        if not weaviate_client.collections.exists(PERSISTENT_COLLECTION_NAME):
+            raise HTTPException(status_code=404, detail="No documents available for chat.")
+        
+        collection = weaviate_client.collections.get(PERSISTENT_COLLECTION_NAME)
+        
+        logger.info("🧠💭 Processing with SEMANTIC memory-aware voice RAG...")
+        try:
+            rag_response, sources_metadata = await ask_question_voice_with_memory(
+                question=recognized_text.strip(),
+                collection=collection,
+                openai_client=openai_client,
+                model=embedding_model,
+                cross_encoder_model=cross_encoder_model,
+                conversation_context=conversation_context,
+                domain_context="",
+                request=request
+            )
+        except Exception as e:
+            if "Client disconnected" in str(e):
+                speech_processor.cleanup_temp_files()
+                raise HTTPException(status_code=499, detail="Client disconnected during RAG")
+            else:
+                raise e
+        
+        # TTS: Text to speech
+        if await request.is_disconnected():
+            speech_processor.cleanup_temp_files()
+            raise HTTPException(status_code=499, detail="Client disconnected")
+        
+        logger.info("🔊 Text-to-Speech conversion...")
+        audio_path = await speech_processor.text_to_speech(rag_response, selected_voice)
+        
+        if not audio_path:
+            raise HTTPException(status_code=500, detail="TTS oluşturulamadı")
+        
+        # Store conversation message
+        mongodb_manager.store_conversation_message(
+            session_id=session_id,
+            question=recognized_text.strip(),
+            answer=rag_response,
+            sources=sources_metadata,
+            interaction_type="voice_memory_public"
+        )
+        
+        # Final disconnection check
+        if await request.is_disconnected():
+            speech_processor.cleanup_temp_files()
+            raise HTTPException(status_code=499, detail="Client disconnected")
+        
+        # Return audio with session info in headers
+        from fastapi.responses import FileResponse
+        try:
+            return FileResponse(
+                audio_path,
+                media_type="audio/mpeg",
+                filename="response.mp3",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "X-Session-ID": session_id,
+                    "X-Is-New-Conversation": str(start_new_conversation or not session_id)
+                }
+            )
+        except (ConnectionResetError, BrokenPipeError):
+            logger.info("🚪 Connection broken while sending response")
+            speech_processor.cleanup_temp_files()
+            raise HTTPException(status_code=499, detail="Connection broken")
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Public memory-aware speech-to-speech error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/upload/progress/{session_id}")
 async def get_upload_progress(session_id: str):
@@ -1490,191 +2093,8 @@ async def get_speech_voices():
         }
     }
 
-@app.post("/api/chat/compare")
-async def compare_performance(message: ChatMessage, token: AuthRequired):
-    """🚀 Performance comparison: Original vs Optimized RAG systems"""
-    global weaviate_client, openai_client, embedding_model, cross_encoder_model, mongodb_manager
-    
-    try:
-        # Get persistent collection
-        if not weaviate_client.collections.exists(PERSISTENT_COLLECTION_NAME):
-            raise HTTPException(status_code=404, detail="No documents available for chat. Please upload documents first.")
-        
-        collection = weaviate_client.collections.get(PERSISTENT_COLLECTION_NAME)
-        
-        import time
-        
-        # 🐌 Test ORIGINAL version
-        print("🐌 Testing ORIGINAL RAG system...")
-        start_time = time.time()
-        
-        original_answer, original_sources = await ask_question(
-            question=message.message.strip(),
-            collection=collection,
-            openai_client=openai_client,
-            model=embedding_model,
-            cross_encoder_model=cross_encoder_model,
-            domain_context=""
-        )
-        
-        original_time = time.time() - start_time
-        print(f"🐌 Original completed in: {original_time:.2f}s")
-        
-        # 🚀 Test OPTIMIZED version
-        print("🚀 Testing OPTIMIZED RAG system...")
-        start_time = time.time()
-        
-        optimized_answer, optimized_sources = await ask_question_optimized(
-            question=message.message.strip(),
-            collection=collection,
-            openai_client=openai_client,
-            model=embedding_model,
-            cross_encoder_model=cross_encoder_model,
-            domain_context=""
-        )
-        
-        optimized_time = time.time() - start_time
-        print(f"🚀 Optimized completed in: {optimized_time:.2f}s")
-        
-        # Calculate improvement
-        speed_improvement = ((original_time - optimized_time) / original_time) * 100 if original_time > 0 else 0
-        
-        # Store comparison results
-        mongodb_manager.store_chat_message(
-            question=message.message.strip(),
-            answer=optimized_answer,
-            sources=optimized_sources,
-            interaction_type="performance_test"
-        )
-        
-        return {
-            "question": message.message.strip(),
-            "performance": {
-                "original_time": round(original_time, 3),
-                "optimized_time": round(optimized_time, 3), 
-                "speed_improvement_percent": round(speed_improvement, 1),
-                "faster_by": round(original_time - optimized_time, 3)
-            },
-            "responses": {
-                "original": {
-                    "answer": original_answer,
-                    "sources": original_sources[:3]  # Top 3 sources
-                },
-                "optimized": {
-                    "answer": optimized_answer,
-                    "sources": optimized_sources[:3]  # Top 3 sources
-                }
-            },
-            "quality_check": {
-                "answers_similar": len(set(original_answer.split()) & set(optimized_answer.split())) > len(original_answer.split()) * 0.7,
-                "source_overlap": len([s for s in optimized_sources[:5] if s in original_sources[:5]]) >= 3
-            },
-            "timestamp": datetime.now().isoformat()
-        }
-        
-    except Exception as e:
-        logger.error(f"❌ Error in performance comparison: {e}")
-        raise HTTPException(status_code=500, detail=f"Error in performance comparison: {str(e)}")
 
-@app.post("/api/voice/compare")
-async def compare_voice_responses(message: ChatMessage, token: AuthRequired):
-    """🎤 Voice vs Text Response comparison - Test voice enhancement"""
-    global weaviate_client, openai_client, embedding_model, cross_encoder_model, mongodb_manager
-    
-    try:
-        # Get persistent collection
-        if not weaviate_client.collections.exists(PERSISTENT_COLLECTION_NAME):
-            raise HTTPException(status_code=404, detail="No documents available for chat. Please upload documents first.")
-        
-        collection = weaviate_client.collections.get(PERSISTENT_COLLECTION_NAME)
-        
-        import time
-        
-        # 📝 Test NORMAL text response (detailed, with formal source references)
-        print("📝 Testing NORMAL TEXT response...")
-        start_time = time.time()
-        
-        text_answer, text_sources = await ask_question_optimized(
-            question=message.message.strip(),
-            collection=collection,
-            openai_client=openai_client,
-            model=embedding_model,
-            cross_encoder_model=cross_encoder_model,
-            domain_context=""
-        )
-        
-        text_time = time.time() - start_time
-        print(f"📝 Text response completed in: {text_time:.2f}s")
-        
-        # 🎤 Test ENHANCED voice response (concise but source-aware)
-        print("🎤 Testing ENHANCED VOICE response...")
-        start_time = time.time()
-        
-        voice_answer, voice_sources = await ask_question_voice_optimized(
-            question=message.message.strip(),
-            collection=collection,
-            openai_client=openai_client,
-            model=embedding_model,
-            cross_encoder_model=cross_encoder_model,
-            domain_context=""
-        )
-        
-        voice_time = time.time() - start_time
-        print(f"🎤 Voice response completed in: {voice_time:.2f}s")
-        
-        # Analyze differences
-        text_has_formal_refs = "[Kaynak:" in text_answer
-        voice_has_natural_refs = any(indicator in voice_answer.lower() for indicator in [
-            'göre', 'belirtildiği', 'mevzuat', 'dosya', 'madde', 'bölüm'
-        ])
-        
-        # Store comparison results
-        mongodb_manager.store_chat_message(
-            question=message.message.strip(),
-            answer=voice_answer,
-            sources=voice_sources,
-            interaction_type="voice_comparison_test"
-        )
-        
-        return {
-            "question": message.message.strip(),
-            "performance": {
-                "text_time": round(text_time, 3),
-                "voice_time": round(voice_time, 3),
-                "time_difference": round(abs(text_time - voice_time), 3)
-            },
-            "responses": {
-                "text": {
-                    "answer": text_answer,
-                    "length": len(text_answer),
-                    "has_formal_sources": text_has_formal_refs,
-                    "sources": text_sources[:3]
-                },
-                "voice": {
-                    "answer": voice_answer,
-                    "length": len(voice_answer),
-                    "has_natural_sources": voice_has_natural_refs,
-                    "sources": voice_sources[:3]
-                }
-            },
-            "analysis": {
-                "voice_is_shorter": len(voice_answer) < len(text_answer),
-                "length_ratio": round(len(voice_answer) / len(text_answer) if len(text_answer) > 0 else 0, 2),
-                "both_have_sources": text_has_formal_refs and voice_has_natural_refs,
-                "source_overlap": len([s for s in voice_sources[:5] if s in text_sources[:5]]) >= 3
-            },
-            "improvement_notes": {
-                "voice_conciseness": "Voice response should be shorter and more natural",
-                "source_integration": "Voice should have natural source references",
-                "same_accuracy": "Both should reference same source materials",
-                "speech_friendly": "Voice should be conversational and flow well"
-            },
-            "timestamp": datetime.now().isoformat()
-        }
-        
-    except Exception as e:
-        logger.error(f"❌ Error in voice comparison: {e}")
-        raise HTTPException(status_code=500, detail=f"Error in voice comparison: {str(e)}")
+
 
 if __name__ == "__main__":
     print("🚀 Starting IntelliDocs API Backend v2.0...")

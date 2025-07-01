@@ -105,6 +105,12 @@ class AdvancedHydeGenerator:
 async def generate_enhanced_hyde(question, client, domain_context=""):
     """Gelişmiş HyDE: Kalite korunarak hızlandırılmış"""
     
+    # Convert question to string if it's a list (fix for unhashable type error)
+    if isinstance(question, list):
+        question = ' '.join(str(q) for q in question)
+    else:
+        question = str(question)
+    
     # OPTIMIZATION 1: Smart HyDE caching
     hyde_cache_key = f"hyde_{hash(question.lower().strip())}_{domain_context}"
     

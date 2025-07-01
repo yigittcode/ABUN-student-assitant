@@ -12,6 +12,7 @@ from pymongo.errors import ConnectionFailure, OperationFailure
 from bson import ObjectId
 import gridfs
 from io import BytesIO
+import uuid
 
 logger = logging.getLogger(__name__)
 
@@ -769,3 +770,577 @@ class MongoDBManager:
         except Exception as e:
             logger.error(f"❌ Error getting database stats: {e}")
             return {}
+
+    # Conversation Session Management Methods
+
+    def create_conversation_session(self, user_email: str, initial_message: str = None) -> str:
+        """
+        Create a new conversation session for a user
+        
+        Args:
+            user_email: User's email address
+            initial_message: Optional initial message
+            
+        Returns:
+            Session ID
+        """
+        try:
+            session_data = {
+                "session_id": str(uuid.uuid4()),
+                "user_email": user_email,
+                "created_at": datetime.utcnow(),
+                "updated_at": datetime.utcnow(),
+                "message_count": 0,
+                "status": "active",
+                "context_summary": "",
+                "initial_message": initial_message
+            }
+            
+            result = self.db.conversation_sessions.insert_one(session_data)
+            session_id = session_data["session_id"]
+            
+            # Create index for faster queries
+            try:
+                self.db.conversation_sessions.create_index([
+                    ("user_email", 1),
+                    ("created_at", -1)
+                ])
+                self.db.conversation_sessions.create_index([("session_id", 1)])
+            except Exception:
+                pass  # Index might already exist
+            
+            logger.info(f"💬 Created conversation session {session_id} for {user_email}")
+            return session_id
+            
+        except Exception as e:
+            logger.error(f"❌ Error creating conversation session: {e}")
+            raise
+
+    def get_conversation_session(self, session_id: str) -> Optional[Dict]:
+        """
+        Get conversation session by ID
+        
+        Args:
+            session_id: Session ID
+            
+        Returns:
+            Session data or None if not found
+        """
+        try:
+            session = self.db.conversation_sessions.find_one({"session_id": session_id})
+            if session:
+                session["_id"] = str(session["_id"])
+            return session
+            
+        except Exception as e:
+            logger.error(f"❌ Error retrieving conversation session {session_id}: {e}")
+            return None
+
+    def get_user_active_session(self, user_email: str) -> Optional[Dict]:
+        """
+        Get user's most recent active conversation session
+        
+        Args:
+            user_email: User's email address
+            
+        Returns:
+            Most recent active session or None
+        """
+        try:
+            session = self.db.conversation_sessions.find_one(
+                {"user_email": user_email, "status": "active"},
+                sort=[("updated_at", -1)]
+            )
+            if session:
+                session["_id"] = str(session["_id"])
+            return session
+            
+        except Exception as e:
+            logger.error(f"❌ Error getting active session for {user_email}: {e}")
+            return None
+
+    def store_conversation_message(self, session_id: str, question: str, answer: str, 
+                                 sources: List[Dict], interaction_type: str = "text") -> str:
+        """
+        Store a chat message within a conversation session
+        
+        Args:
+            session_id: Conversation session ID
+            question: User question
+            answer: Bot answer
+            sources: List of source references
+            interaction_type: Type of interaction (text, voice, stream)
+            
+        Returns:
+            Message ID
+        """
+        try:
+            # Store the message
+            message_data = {
+                "session_id": session_id,
+                "question": question,
+                "answer": answer,
+                "sources": sources,
+                "interaction_type": interaction_type,
+                "timestamp": datetime.utcnow()
+            }
+            
+            result = self.db.conversation_messages.insert_one(message_data)
+            message_id = str(result.inserted_id)
+            
+            # Update session
+            self.db.conversation_sessions.update_one(
+                {"session_id": session_id},
+                {
+                    "$set": {"updated_at": datetime.utcnow()},
+                    "$inc": {"message_count": 1}
+                }
+            )
+            
+            # Also store in legacy chat_history for backward compatibility
+            self.store_chat_message(question, answer, sources, interaction_type)
+            
+            logger.info(f"💬 Stored conversation message {message_id} in session {session_id}")
+            return message_id
+            
+        except Exception as e:
+            logger.error(f"❌ Error storing conversation message: {e}")
+            raise
+
+    def get_conversation_history(self, session_id: str, limit: int = 20) -> List[Dict]:
+        """
+        Get conversation history for a session
+        
+        Args:
+            session_id: Session ID
+            limit: Maximum number of messages to retrieve
+            
+        Returns:
+            List of conversation messages
+        """
+        try:
+            messages = list(
+                self.db.conversation_messages
+                .find({"session_id": session_id})
+                .sort("timestamp", 1)  # Oldest first for conversation flow
+                .limit(limit)
+            )
+            
+            # Convert ObjectId to string
+            for msg in messages:
+                msg["_id"] = str(msg["_id"])
+            
+            logger.info(f"💬 Retrieved {len(messages)} messages for session {session_id}")
+            return messages
+            
+        except Exception as e:
+            logger.error(f"❌ Error retrieving conversation history for {session_id}: {e}")
+            return []
+
+    def get_recent_conversation_context(self, session_id: str, max_messages: int = 10, 
+                                       max_tokens: int = 2000) -> str:
+        """
+        Get recent conversation context formatted for RAG prompt
+        
+        Args:
+            session_id: Session ID
+            max_messages: Maximum number of recent messages
+            max_tokens: Maximum token limit for context
+            
+        Returns:
+            Formatted conversation context
+        """
+        try:
+            # Get recent messages (reverse order to get most recent first)
+            messages = list(
+                self.db.conversation_messages
+                .find({"session_id": session_id})
+                .sort("timestamp", -1)
+                .limit(max_messages)
+            )
+            
+            if not messages:
+                return ""
+            
+            # Reverse to get chronological order
+            messages.reverse()
+            
+            # Build context with token estimation
+            context_parts = []
+            total_tokens = 0
+            
+            for msg in messages:
+                question = msg.get("question", "").strip()
+                answer = msg.get("answer", "").strip()
+                
+                if question and answer:
+                    # Estimate tokens (rough: 1 token ≈ 4 characters)
+                    msg_tokens = (len(question) + len(answer)) // 4
+                    
+                    if total_tokens + msg_tokens > max_tokens:
+                        break
+                        
+                    context_parts.append(f"Kullanıcı: {question}")
+                    context_parts.append(f"Asistan: {answer}")
+                    total_tokens += msg_tokens
+            
+            if context_parts:
+                context = "\n".join(context_parts)
+                logger.info(f"💭 Built conversation context: {len(context_parts)//2} messages, ~{total_tokens} tokens")
+                return context
+            else:
+                return ""
+                
+        except Exception as e:
+            logger.error(f"❌ Error building conversation context for {session_id}: {e}")
+            return ""
+
+    def close_conversation_session(self, session_id: str, summary: str = None) -> bool:
+        """
+        Close a conversation session
+        
+        Args:
+            session_id: Session ID to close
+            summary: Optional conversation summary
+            
+        Returns:
+            True if successful
+        """
+        try:
+            update_data = {
+                "status": "closed",
+                "closed_at": datetime.utcnow(),
+                "updated_at": datetime.utcnow()
+            }
+            
+            if summary:
+                update_data["context_summary"] = summary
+            
+            result = self.db.conversation_sessions.update_one(
+                {"session_id": session_id},
+                {"$set": update_data}
+            )
+            
+            success = result.modified_count > 0
+            if success:
+                logger.info(f"🔒 Closed conversation session {session_id}")
+            
+            return success
+            
+        except Exception as e:
+            logger.error(f"❌ Error closing conversation session {session_id}: {e}")
+            return False
+
+    def cleanup_old_sessions(self, days_old: int = 30, inactive_days: int = 7) -> Dict[str, int]:
+        """
+        Clean up old and inactive conversation sessions
+        
+        Args:
+            days_old: Remove sessions older than this many days
+            inactive_days: Close sessions inactive for this many days
+            
+        Returns:
+            Dictionary with cleanup statistics
+        """
+        try:
+            now = datetime.utcnow()
+            
+            # Close inactive sessions
+            inactive_cutoff = now - timedelta(days=inactive_days)
+            inactive_result = self.db.conversation_sessions.update_many(
+                {
+                    "status": "active",
+                    "updated_at": {"$lt": inactive_cutoff}
+                },
+                {
+                    "$set": {
+                        "status": "inactive",
+                        "closed_at": now,
+                        "updated_at": now
+                    }
+                }
+            )
+            
+            # Remove very old sessions
+            old_cutoff = now - timedelta(days=days_old)
+            
+            # First get session IDs to remove
+            old_sessions = list(self.db.conversation_sessions.find(
+                {"created_at": {"$lt": old_cutoff}},
+                {"session_id": 1}
+            ))
+            
+            old_session_ids = [s["session_id"] for s in old_sessions]
+            
+            # Remove messages for old sessions
+            messages_result = self.db.conversation_messages.delete_many(
+                {"session_id": {"$in": old_session_ids}}
+            )
+            
+            # Remove old sessions
+            sessions_result = self.db.conversation_sessions.delete_many(
+                {"created_at": {"$lt": old_cutoff}}
+            )
+            
+            stats = {
+                "sessions_closed": inactive_result.modified_count,
+                "sessions_deleted": sessions_result.deleted_count,
+                "messages_deleted": messages_result.deleted_count
+            }
+            
+            logger.info(f"🧹 Session cleanup: {stats}")
+            return stats
+            
+        except Exception as e:
+            logger.error(f"❌ Error during session cleanup: {e}")
+            return {"sessions_closed": 0, "sessions_deleted": 0, "messages_deleted": 0}
+
+    def get_user_conversations(self, user_email: str, limit: int = 20) -> List[Dict]:
+        """
+        Get user's conversation sessions
+        
+        Args:
+            user_email: User's email address
+            limit: Maximum number of sessions to return
+            
+        Returns:
+            List of conversation sessions
+        """
+        try:
+            sessions = list(
+                self.db.conversation_sessions
+                .find({"user_email": user_email})
+                .sort("updated_at", -1)
+                .limit(limit)
+            )
+            
+            # Convert ObjectId to string and add summary info
+            for session in sessions:
+                session["_id"] = str(session["_id"])
+                
+                # Get first and last message for preview
+                first_msg = self.db.conversation_messages.find_one(
+                    {"session_id": session["session_id"]},
+                    sort=[("timestamp", 1)]
+                )
+                
+                last_msg = self.db.conversation_messages.find_one(
+                    {"session_id": session["session_id"]},
+                    sort=[("timestamp", -1)]
+                )
+                
+                session["first_message"] = first_msg.get("question", "") if first_msg else ""
+                session["last_message"] = last_msg.get("question", "") if last_msg else ""
+            
+            logger.info(f"📚 Retrieved {len(sessions)} conversation sessions for {user_email}")
+            return sessions
+            
+        except Exception as e:
+            logger.error(f"❌ Error retrieving user conversations for {user_email}: {e}")
+            return []
+
+    def create_anonymous_conversation_session(self, initial_message: str = None, user_identifier: str = None) -> str:
+        """
+        Create a new anonymous conversation session for public users
+        
+        Args:
+            initial_message: Optional initial message
+            user_identifier: Optional anonymous identifier (IP, browser fingerprint, etc.)
+            
+        Returns:
+            Session ID
+        """
+        try:
+            session_data = {
+                "session_id": str(uuid.uuid4()),
+                "user_email": user_identifier or "anonymous",
+                "is_anonymous": True,
+                "created_at": datetime.utcnow(),
+                "updated_at": datetime.utcnow(),
+                "message_count": 0,
+                "status": "active",
+                "context_summary": "",
+                "initial_message": initial_message
+            }
+            
+            result = self.db.conversation_sessions.insert_one(session_data)
+            session_id = session_data["session_id"]
+            
+            # Create index for faster queries
+            try:
+                self.db.conversation_sessions.create_index([
+                    ("user_email", 1),
+                    ("created_at", -1)
+                ])
+                self.db.conversation_sessions.create_index([("session_id", 1)])
+                self.db.conversation_sessions.create_index([("is_anonymous", 1)])
+            except Exception:
+                pass  # Index might already exist
+            
+            logger.info(f"💬 Created anonymous conversation session {session_id}")
+            return session_id
+            
+        except Exception as e:
+            logger.error(f"❌ Error creating anonymous conversation session: {e}")
+            raise
+
+    def get_anonymous_user_conversations(self, user_identifier: str, limit: int = 20) -> List[Dict]:
+        """
+        Get anonymous user's conversation sessions
+        
+        Args:
+            user_identifier: Anonymous user identifier
+            limit: Maximum number of sessions to return
+            
+        Returns:
+            List of conversation sessions
+        """
+        try:
+            sessions = list(
+                self.db.conversation_sessions
+                .find({"user_email": user_identifier, "is_anonymous": True})
+                .sort("updated_at", -1)
+                .limit(limit)
+            )
+            
+            # Convert ObjectId to string and add summary info
+            for session in sessions:
+                session["_id"] = str(session["_id"])
+                
+                # Get first and last message for preview
+                first_msg = self.db.conversation_messages.find_one(
+                    {"session_id": session["session_id"]},
+                    sort=[("timestamp", 1)]
+                )
+                
+                last_msg = self.db.conversation_messages.find_one(
+                    {"session_id": session["session_id"]},
+                    sort=[("timestamp", -1)]
+                )
+                
+                session["first_message"] = first_msg.get("question", "") if first_msg else ""
+                session["last_message"] = last_msg.get("question", "") if last_msg else ""
+            
+            logger.info(f"📚 Retrieved {len(sessions)} anonymous conversation sessions for {user_identifier}")
+            return sessions
+            
+        except Exception as e:
+            logger.error(f"❌ Error retrieving anonymous user conversations for {user_identifier}: {e}")
+            return []
+
+    def delete_user_session(self, session_id: str) -> bool:
+        """
+        Delete a specific conversation session and all its messages
+        
+        Args:
+            session_id: Session ID to delete
+            
+        Returns:
+            True if successful
+        """
+        try:
+            # Delete all messages for this session
+            messages_result = self.db.conversation_messages.delete_many(
+                {"session_id": session_id}
+            )
+            
+            # Delete the session itself
+            session_result = self.db.conversation_sessions.delete_one(
+                {"session_id": session_id}
+            )
+            
+            success = session_result.deleted_count > 0
+            if success:
+                logger.info(f"🗑️ Deleted session {session_id} and {messages_result.deleted_count} messages")
+            
+            return success
+            
+        except Exception as e:
+            logger.error(f"❌ Error deleting session {session_id}: {e}")
+            return False
+
+    def get_user_sessions_by_identifier(self, user_identifier: str, limit: int = 20) -> List[Dict]:
+        """
+        Get conversation sessions by user identifier (for anonymous users)
+        
+        Args:
+            user_identifier: User identifier (e.g., "anon_192.168.1.1")
+            limit: Maximum number of sessions to return
+            
+        Returns:
+            List of conversation sessions
+        """
+        try:
+            sessions = list(
+                self.db.conversation_sessions
+                .find({"user_email": user_identifier})
+                .sort("updated_at", -1)
+                .limit(limit)
+            )
+            
+            # Convert ObjectId to string and add summary info
+            for session in sessions:
+                session["_id"] = str(session["_id"])
+                
+                # Get first and last message for preview
+                first_msg = self.db.conversation_messages.find_one(
+                    {"session_id": session["session_id"]},
+                    sort=[("timestamp", 1)]
+                )
+                
+                last_msg = self.db.conversation_messages.find_one(
+                    {"session_id": session["session_id"]},
+                    sort=[("timestamp", -1)]
+                )
+                
+                session["first_message"] = first_msg.get("question", "") if first_msg else ""
+                session["last_message"] = last_msg.get("question", "") if last_msg else ""
+            
+            logger.info(f"📚 Retrieved {len(sessions)} sessions for identifier {user_identifier}")
+            return sessions
+            
+        except Exception as e:
+            logger.error(f"❌ Error retrieving sessions for {user_identifier}: {e}")
+            return []
+
+    def delete_all_user_sessions(self, user_identifier: str) -> int:
+        """
+        Delete ALL conversation sessions for a user identifier
+        
+        Args:
+            user_identifier: User identifier to delete sessions for
+            
+        Returns:
+            Number of sessions deleted
+        """
+        try:
+            # Get all session IDs for this user
+            sessions = list(self.db.conversation_sessions.find(
+                {"user_email": user_identifier},
+                {"session_id": 1}
+            ))
+            
+            session_ids = [s["session_id"] for s in sessions]
+            
+            if not session_ids:
+                return 0
+            
+            # Delete all messages for these sessions
+            messages_result = self.db.conversation_messages.delete_many(
+                {"session_id": {"$in": session_ids}}
+            )
+            
+            # Delete all sessions for this user
+            sessions_result = self.db.conversation_sessions.delete_many(
+                {"user_email": user_identifier}
+            )
+            
+            deleted_count = sessions_result.deleted_count
+            if deleted_count > 0:
+                logger.info(f"🗑️ Deleted {deleted_count} sessions and {messages_result.deleted_count} messages for {user_identifier}")
+            
+            return deleted_count
+            
+        except Exception as e:
+            logger.error(f"❌ Error deleting all sessions for {user_identifier}: {e}")
+            return 0

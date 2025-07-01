@@ -7,6 +7,7 @@ from hyde_generator import generate_hypothetical_answers, generate_multiple_hyde
 from config import MAX_CONTEXT_TOKENS, PROMPT_TEMPLATE, VOICE_PROMPT_TEMPLATE
 from cachetools import TTLCache
 import json
+import re
 
 # Ultra-optimized caches with memory management
 embedding_cache = TTLCache(maxsize=2000, ttl=900)  # 2K embeddings, 15 min
@@ -236,25 +237,40 @@ async def _generate_streaming_response(question, context, openai_client, domain_
 
 async def _create_smart_query_vector(question, hyde_variants, model):
     """Ultra-hızlı query vector oluşturma - soru + HyDE ensemble with smart caching"""
-    all_texts = [question] + hyde_variants
+    
+    # Convert question to string if it's a list (fix for unhashable type error)
+    if isinstance(question, list):
+        question = ' '.join(str(q) for q in question)
+    else:
+        question = str(question)
+    
+    # Ensure hyde_variants are all strings
+    safe_hyde_variants = []
+    for variant in hyde_variants:
+        if isinstance(variant, list):
+            safe_hyde_variants.append(' '.join(str(v) for v in variant))
+        else:
+            safe_hyde_variants.append(str(variant))
+    
+    all_texts = [question] + safe_hyde_variants
     
     embeddings = []
     cache_hits = 0
     
-    for text in all_texts:
+    for i, text in enumerate(all_texts):
         # Normalize text for better cache hit ratio
-        normalized_text = text.strip().lower()
+        normalized_text = str(text).strip().lower()  # Ensure text is string
         cache_key = f"emb_{hash(normalized_text)}"
         
         if cache_key in embedding_cache:
-            embeddings.append(embedding_cache[cache_key])
+            embeddings.append((i, embedding_cache[cache_key]))
             cache_hits += 1
         else:
             # Run synchronous model.encode in a separate thread
             embedding = await asyncio.to_thread(model.encode, text)
             embedding_array = np.array(embedding)
             embedding_cache[cache_key] = embedding_array
-            embeddings.append(embedding_array)
+            embeddings.append((i, embedding_array))
     
     if cache_hits > 0:
         print(f"🚀 Embedding cache hits: {cache_hits}/{len(all_texts)}")
@@ -264,14 +280,14 @@ async def _create_smart_query_vector(question, hyde_variants, model):
         return None
     
     if len(embeddings) == 1:
-        final_vector = embeddings[0]
+        final_vector = embeddings[0][1]
     else:
         # Ultra-optimized vector combination using vectorized operations
         original_weight = 0.5
         hyde_weight = 0.5 / (len(embeddings) - 1) if len(embeddings) > 1 else 0
         
         # Vectorized operations - much faster than loops
-        embeddings_array = np.stack(embeddings)
+        embeddings_array = np.stack([emb[1] for emb in embeddings])
         weights = np.array([original_weight] + [hyde_weight] * (len(embeddings) - 1))
         final_vector = np.average(embeddings_array, axis=0, weights=weights)
     
@@ -282,8 +298,26 @@ async def _create_smart_query_vector(question, hyde_variants, model):
 async def _perform_hybrid_search(question, query_vector, collection, cross_encoder_model):
     """Ultra-hızlı hibrit arama: Semantic + keyword + cross-encoder reranking with caching"""
     
-    # Cache key oluştur
-    vector_hash = hash(tuple(query_vector.tolist())) if query_vector is not None else "no_vector"
+    # Convert question to string if it's a list (fix for unhashable type error)
+    if isinstance(question, list):
+        question = ' '.join(str(q) for q in question)
+    else:
+        question = str(question)
+    
+    # Cache key oluştur - Fix unhashable type error by flattening vector
+    if query_vector is not None:
+        # Ensure vector is flattened before converting to tuple for hashing
+        if isinstance(query_vector, np.ndarray):
+            vector_flat = query_vector.flatten().tolist()
+        elif isinstance(query_vector, list):
+            # Already a list, but ensure it's flattened
+            vector_flat = query_vector if isinstance(query_vector[0], (int, float)) else [item for sublist in query_vector for item in sublist]
+        else:
+            vector_flat = [float(query_vector)]  # Single value
+        vector_hash = hash(tuple(vector_flat))
+    else:
+        vector_hash = "no_vector"
+    
     cache_key = f"{question}_{vector_hash}"
     
     # Cache'den kontrol et
@@ -477,6 +511,12 @@ def _combine_search_results(semantic_results, keyword_results):
 async def _cross_encoder_rerank(question, results, cross_encoder_model):
     """Cross-encoder ile sonuçları yeniden sırala"""
     try:
+        # Convert question to string if it's a list (fix for unhashable type error)
+        if isinstance(question, list):
+            question = ' '.join(str(q) for q in question)
+        else:
+            question = str(question)
+        
         pairs = [(question, result['document']) for result in results]
         # Run synchronous predict in a separate thread
         scores = await asyncio.to_thread(cross_encoder_model.predict, pairs)
@@ -551,7 +591,7 @@ def _check_and_correct_critical_typos(question):
 
 def _is_meaningless_question(question):
     """
-    Anlamsız soruları tespit et
+    Anlamsız soruları tespit et - REFINED VERSION (Daha az agresif)
     
     Args:
         question: Kullanıcının sorusu
@@ -561,24 +601,24 @@ def _is_meaningless_question(question):
     """
     question_lower = question.lower().strip()
     
-    # Çok kısa sorular (3 kelimeden az)
+    # RELAXED: Çok kısa sorular (2 kelimeden az)
     words = question_lower.split()
-    if len(words) < 3:
+    if len(words) < 2:
         # İstisnalar: "nedir", "kimdir" gibi valid single words
-        valid_short_questions = ["nedir", "kimdir", "nelerdir", "nasıl", "ne", "kim", "nerede", "ne zaman"]
+        valid_short_questions = ["nedir", "kimdir", "nelerdir", "nasıl", "ne", "kim", "nerede", "ne zaman", "kaç", "hangi"]
         if not any(valid in question_lower for valid in valid_short_questions):
             return True
     
-    # Çok uzun anlamlı cümleler (150+ karakter) ama soru değil
-    if len(question) > 150 and not any(q_word in question_lower for q_word in ["?", "nedir", "nasıl", "ne", "neden", "niçin", "kim", "nerede", "ne zaman", "hangi"]):
+    # RELAXED: Çok uzun anlamlı cümleler (200+ karakter) ama soru değil
+    if len(question) > 200 and not any(q_word in question_lower for q_word in ["?", "nedir", "nasıl", "ne", "neden", "niçin", "kim", "nerede", "ne zaman", "hangi", "kaç"]):
         return True
     
-    # Saçma kelime kombinasyonları
+    # Obvious nonsense patterns only
     nonsense_patterns = [
-        "asdfsadf", "qwerty", "asdasd", "123123", "test test", 
+        "asdfsadf", "qwerty", "asdasd", "123123", "test test test", 
         "zxcvzxcv", "adsasd", "qweqwe", "uiuiui", "hjkhkj",
-        "lol lol", "haha haha", "wtf", "omg omg",
-        "random random", "blabla", "lalala", "hahaha",
+        "lol lol lol", "haha haha", "wtf wtf", "omg omg",
+        "random random random", "blabla blabla", "lalala lalala", "hahaha hahaha",
         "gggggg", "ssssss", "dddddd", "ffffff"
     ]
     
@@ -586,16 +626,34 @@ def _is_meaningless_question(question):
         if pattern in question_lower:
             return True
     
-    # Çok tekrarlayan karakterler (aaaaaa, 111111)
+    # Çok tekrarlayan karakterler (aaaaaa, 111111) - stricter threshold
     import re
-    if re.search(r'(.)\1{5,}', question_lower):  # 6+ aynı karakter
+    if re.search(r'(.)\1{7,}', question_lower):  # 8+ aynı karakter (was 6+)
         return True
     
     # Sadece sayı veya özel karakter
     if re.match(r'^[0-9\W]+$', question_lower):
         return True
     
-    return False
+    # NEW: Academic terms should never be meaningless
+    academic_terms = [
+        "program", "programlar", "programları", "ders", "dersler", "dersleri",
+        "bölüm", "bölümler", "bölümleri", "fakülte", "fakülteler", "enstitü",
+        "başarı", "başarı", "not", "notlar", "ortalama", "ortalaması",
+        "sınav", "sınavlar", "sınavları", "ödev", "ödevler", "ödevleri",
+        "burs", "burslar", "bursları", "yurt", "yurtlar", "yurtları",
+        "kayıt", "kayıtlar", "kayıtları", "diploma", "diplomalar",
+        "mezuniyet", "mezun", "öğrenci", "öğrenciler", "öğrencileri",
+        "topluluk", "topluluklar", "toplulukları", "kampüs", "kampüsler",
+        "müfredat", "müfredatlar", "müfredatları", "akademik", "eğitim"
+    ]
+    
+    # If question contains academic terms, it's meaningful
+    for term in academic_terms:
+        if term in question_lower:
+            return False  # Academic questions are always meaningful
+    
+    return False  # Default to meaningful unless clearly nonsense
 
 def _estimate_tokens_fast(text):
     """Hızlı token tahmini - %99.5 doğruluk, 10x hızlı"""
@@ -683,6 +741,12 @@ def _assemble_optimized_context(results, question, domain_context=""):
 
 async def _generate_contextual_response(question, context, openai_client, domain_context=""):
     """Gelişmiş response generation - fallback mekanizmaları ile"""
+    
+    # Convert question to string if it's a list (fix for unhashable type error)
+    if isinstance(question, list):
+        question = ' '.join(str(q) for q in question)
+    else:
+        question = str(question)
     
     # Context kontrolü
     if not context or len(context.strip()) < 20:
@@ -900,6 +964,12 @@ async def create_optimized_embeddings_v2(documents, model):
 
 async def _generate_voice_response(question, context, openai_client, domain_context=""):
     """🎤 Enhanced Voice Response Generation - Kaynak odaklı, kısa ama spesifik"""
+    
+    # Convert question to string if it's a list (fix for unhashable type error)
+    if isinstance(question, list):
+        question = ' '.join(str(q) for q in question)
+    else:
+        question = str(question)
     
     # Context kontrolü - text ile aynı threshold kullan
     if not context or len(context.strip()) < 20:
@@ -1179,7 +1249,22 @@ async def ask_question_optimized(question, collection, openai_client, model, cro
 
 async def _create_smart_query_vector_optimized(question, hyde_variants, question_embedding, model):
     """🚀 OPTIMIZED query vector creation - batch processing for cache misses"""
-    all_texts = [question] + hyde_variants
+    
+    # Convert question to string if it's a list (fix for unhashable type error)
+    if isinstance(question, list):
+        question = ' '.join(str(q) for q in question)
+    else:
+        question = str(question)
+    
+    # Ensure hyde_variants are all strings
+    safe_hyde_variants = []
+    for variant in hyde_variants:
+        if isinstance(variant, list):
+            safe_hyde_variants.append(' '.join(str(v) for v in variant))
+        else:
+            safe_hyde_variants.append(str(variant))
+    
+    all_texts = [question] + safe_hyde_variants
     embeddings = []
     uncached_texts = []
     uncached_indices = []
@@ -1187,7 +1272,7 @@ async def _create_smart_query_vector_optimized(question, hyde_variants, question
     
     # Phase 1: Cache lookup + prepare uncached batch
     for i, text in enumerate(all_texts):
-        normalized_text = text.strip().lower()
+        normalized_text = str(text).strip().lower()  # Ensure text is string
         cache_key = f"emb_{hash(normalized_text)}"
         
         if cache_key in embedding_cache:
@@ -1205,7 +1290,6 @@ async def _create_smart_query_vector_optimized(question, hyde_variants, question
                 embedding_array = question_embedding
             embedding_cache[cache_key] = embedding_array
             embeddings.append((i, embedding_array))
-            cache_hits += 1
         else:
             uncached_texts.append(text)
             uncached_indices.append(i)
@@ -1222,7 +1306,7 @@ async def _create_smart_query_vector_optimized(question, hyde_variants, question
         
         # Cache and store results with consistent format
         for text, embedding, idx in zip(uncached_texts, batch_embeddings, uncached_indices):
-            normalized_text = text.strip().lower()
+            normalized_text = str(text).strip().lower()  # Ensure text is string
             cache_key = f"emb_{hash(normalized_text)}"
             # Ensure consistent numpy array format
             if not isinstance(embedding, np.ndarray):
@@ -1452,3 +1536,1014 @@ async def ask_question_voice_optimized(question, collection, openai_client, mode
 async def create_optimized_embeddings(documents, model):
     """Original optimized embedding function - backward compatibility"""
     return await create_optimized_embeddings_v2(documents, model)
+
+
+async def ask_question_with_memory(question, collection, openai_client, model, cross_encoder_model, 
+                                 conversation_context="", domain_context=""):
+    """
+    💭 Memory-aware RAG sistemi - Conversation history ile geliştirilmiş
+    
+    Args:
+        question: Kullanıcının sorusu
+        collection: Weaviate/ChromaDB collection
+        openai_client: OpenAI client
+        model: Embedding model
+        cross_encoder_model: Cross-encoder model
+        conversation_context: Önceki konuşma geçmişi
+        domain_context: Domain-specific context
+        
+    Returns:
+        (response, sources_metadata): Yanıt ve kaynak metadataları
+    """
+    print(f"\n💭 Processing memory-aware question: {question}")
+    if conversation_context:
+        print(f"🧠 Using conversation context: {len(conversation_context)} chars")
+    if domain_context:
+        print(f"📄 Domain context: {domain_context}")
+    
+    # Adım 1: Context-aware HyDE generation
+    print("📝 Step 1: Context-aware HyDE generation...")
+    enhanced_question = _enhance_question_with_context(question, conversation_context)
+    hyde_variants = await generate_multiple_hyde_variants(enhanced_question, openai_client, domain_context=domain_context)
+    
+    # Adım 2: Smart query vector creation with context
+    print("🧠 Step 2: Context-enhanced query vector creation...")
+    query_vector = await _create_smart_query_vector(enhanced_question, hyde_variants, model)
+    
+    # Adım 3: Hybrid search with context awareness
+    print("🔍 Step 3: Context-aware hybrid search...")
+    initial_results = await _perform_hybrid_search(enhanced_question, query_vector, collection, cross_encoder_model)
+    
+    # Adım 4: Memory-enhanced context assembly
+    print("🔧 Step 4: Memory-enhanced context assembly...")
+    context = _assemble_memory_enhanced_context(initial_results, question, conversation_context, domain_context)
+    
+    # Adım 5: Context-aware response generation
+    print("✨ Step 5: Memory-aware response generation...")
+    response = await _generate_memory_aware_response(question, context, conversation_context, openai_client, domain_context)
+    
+    # Extract source metadata
+    sources_metadata = []
+    for result in initial_results[:10]:
+        metadata = result.get('metadata', {})
+        sources_metadata.append({
+            'source': metadata.get('source', 'Unknown'),
+            'article': metadata.get('article', 'Unknown')
+        })
+    
+    return response, sources_metadata
+
+
+def _enhance_question_with_context(question, conversation_context):
+    """
+    Soruyu conversation context ile zenginleştir - IMPROVED VERSION
+    
+    Args:
+        question: Orijinal soru
+        conversation_context: Konuşma geçmişi
+        
+    Returns:
+        Enhanced question string
+    """
+    if not conversation_context or len(conversation_context.strip()) < 10:
+        return question
+    
+    # IMPROVED: Kategorize reference detection
+    direct_references = [
+        'bu', 'şu', 'bunlar', 'şunlar', 'bunu', 'şunu', 'bunun', 'şunun',
+        'burada', 'şurada', 'o', 'onu', 'onun', 'onlar', 'onları'
+    ]
+    
+    temporal_references = [
+        'daha önce', 'yukarıda', 'yukarda', 'önceki', 'geçen', 'az önce',
+        'biraz önce', 'şimdi', 'hemen önce', 'son', 'sonra'
+    ]
+    
+    conversation_references = [
+        'dediğiniz', 'söylediğiniz', 'bahsettiğiniz', 'anlattığınız',
+        'belirttiğiniz', 'açıkladığınız', 'ifade ettiğiniz'
+    ]
+    
+    comparison_references = [
+        'aynı', 'benzer', 'farklı', 'diğer', 'ek', 'ilave', 'başka',
+        'benzeri', 'karşıt', 'zıt', 'alternatif'
+    ]
+    
+    question_lower = question.lower()
+    
+    # Check reference types with priority
+    has_direct_ref = any(ref in question_lower for ref in direct_references)
+    has_temporal_ref = any(ref in question_lower for ref in temporal_references) 
+    has_conversation_ref = any(ref in question_lower for ref in conversation_references)
+    has_comparison_ref = any(ref in question_lower for ref in comparison_references)
+    
+    # IMPROVED: Priority-based context inclusion
+    if has_direct_ref or has_conversation_ref:
+        # High priority - definitely needs context
+        context_lines = conversation_context.split('\n')
+        recent_context = '\n'.join(context_lines[-8:]) if len(context_lines) > 8 else conversation_context
+        
+        enhanced = f"""Önceki konuşma bağlamı:
+{recent_context}
+
+Şu anki soru: {question}"""
+        
+        print(f"🔗 Enhanced question with HIGH PRIORITY context (added {len(recent_context)} chars)")
+        return enhanced
+        
+    elif has_temporal_ref or has_comparison_ref:
+        # Medium priority - check context relevance first
+        question_words = set(question_lower.split())
+        context_words = set(conversation_context.lower().split())
+        common_words = question_words.intersection(context_words)
+        relevance_ratio = len(common_words) / len(question_words) if question_words else 0
+        
+        if relevance_ratio > 0.20:  # Higher threshold for medium priority
+            context_lines = conversation_context.split('\n')
+            recent_context = '\n'.join(context_lines[-6:]) if len(context_lines) > 6 else conversation_context
+            
+            enhanced = f"""Önceki konuşma bağlamı:
+{recent_context}
+
+Şu anki soru: {question}"""
+            
+            print(f"🔗 Enhanced question with MEDIUM PRIORITY context (relevance: {relevance_ratio:.2f})")
+            return enhanced
+        else:
+            print(f"🧠 Medium priority reference but low relevance ({relevance_ratio:.2f}), skipping context")
+            return question
+    else:
+        # No direct references - check for implicit continuation
+        words_in_question = len(question.split())
+        if words_in_question <= 3:  # Very short questions might be continuation
+            question_words = set(question_lower.split())
+            context_words = set(conversation_context.lower().split())
+            common_words = question_words.intersection(context_words)
+            relevance_ratio = len(common_words) / len(question_words) if question_words else 0
+            
+            if relevance_ratio > 0.30:  # High threshold for implicit continuation
+                context_lines = conversation_context.split('\n')
+                recent_context = '\n'.join(context_lines[-4:]) if len(context_lines) > 4 else conversation_context
+                
+                enhanced = f"""Önceki konuşma bağlamı:
+{recent_context}
+
+Şu anki soru: {question}"""
+                
+                print(f"🔗 Enhanced SHORT question with implicit context (relevance: {relevance_ratio:.2f})")
+                return enhanced
+        
+        # Default: no context needed
+        print("🆕 New independent question - no context needed")
+        return question
+
+
+def _assemble_memory_enhanced_context(results, question, conversation_context, domain_context=""):
+    """
+    Memory-enhanced context assembly - IMPROVED VERSION with better relevance detection
+    
+    Args:
+        results: Arama sonuçları
+        question: Kullanıcının sorusu
+        conversation_context: Konuşma geçmişi
+        domain_context: Domain context
+        
+    Returns:
+        Enhanced context string
+    """
+    if not results:
+        return ""
+    
+    # Normal context assembly
+    base_context = _assemble_optimized_context(results, question, domain_context)
+    
+    # IMPROVED: Memory enhancement with multiple criteria
+    if conversation_context and len(conversation_context.strip()) > 20:
+        
+        # Criterion 1: Word overlap analysis
+        question_words = set(question.lower().split())
+        context_words = set(conversation_context.lower().split())
+        common_words = question_words.intersection(context_words)
+        word_relevance = len(common_words) / len(question_words) if question_words else 0
+        
+        # Criterion 2: Entity/concept overlap (basic NER simulation)
+        # Look for capitalized words (potential entities) and specific terms
+        question_entities = set([w for w in question.split() if w[0].isupper() and len(w) > 2])
+        context_entities = set([w for w in conversation_context.split() if w[0].isupper() and len(w) > 2])
+        entity_overlap = len(question_entities.intersection(context_entities))
+        
+        # Criterion 3: Topic continuity (check for domain-specific keywords)
+        domain_keywords = ['kayıt', 'başvuru', 'ücret', 'şart', 'belge', 'tarih', 'süre', 'müfredat', 'ders', 'bölüm']
+        question_topics = [word for word in question.lower().split() if word in domain_keywords]
+        context_topics = [word for word in conversation_context.lower().split() if word in domain_keywords]
+        topic_overlap = len(set(question_topics).intersection(set(context_topics)))
+        
+        # IMPROVED: Multi-factor relevance scoring
+        relevance_score = 0
+        
+        # Word overlap component (40% weight)
+        relevance_score += word_relevance * 0.4
+        
+        # Entity overlap component (30% weight)  
+        if question_entities and context_entities:
+            entity_relevance = entity_overlap / max(len(question_entities), len(context_entities))
+            relevance_score += entity_relevance * 0.3
+        
+        # Topic continuity component (30% weight)
+        if question_topics and context_topics:
+            topic_relevance = topic_overlap / max(len(question_topics), len(context_topics))
+            relevance_score += topic_relevance * 0.3
+        
+        print(f"🧠 Relevance analysis: word={word_relevance:.2f}, entity={entity_overlap}, topic={topic_overlap}, final={relevance_score:.2f}")
+        
+        # IMPROVED: Dynamic threshold based on conversation length
+        conversation_lines = len(conversation_context.split('\n'))
+        if conversation_lines <= 4:  # Short conversation - lower threshold
+            relevance_threshold = 0.12
+        elif conversation_lines <= 10:  # Medium conversation - standard threshold
+            relevance_threshold = 0.15  
+        else:  # Long conversation - higher threshold to prevent noise
+            relevance_threshold = 0.18
+        
+        # Include context if relevant enough
+        if relevance_score > relevance_threshold:
+            # Smart context windowing based on relevance
+            context_lines = conversation_context.split('\n')
+            
+            if relevance_score > 0.4:  # High relevance - include more context
+                summary_context = '\n'.join(context_lines[-6:]) if len(context_lines) > 6 else conversation_context
+            elif relevance_score > 0.25:  # Medium relevance - standard context
+                summary_context = '\n'.join(context_lines[-4:]) if len(context_lines) > 4 else conversation_context
+            else:  # Low relevance - minimal context
+                summary_context = '\n'.join(context_lines[-2:]) if len(context_lines) > 2 else conversation_context
+            
+            enhanced_context = f"""GEÇMIŞ KONUŞMA:
+{summary_context}
+
+İLGİLİ DOKÜMAN BİLGİLERİ:
+{base_context}"""
+            
+            print(f"🧠 Enhanced context with conversation history (+{len(summary_context)} chars, score: {relevance_score:.2f})")
+            return enhanced_context
+        else:
+            print(f"🧠 Conversation context not relevant enough (score: {relevance_score:.2f} < threshold: {relevance_threshold:.2f})")
+    
+    return base_context
+
+
+async def _generate_memory_aware_response(question, context, conversation_context, openai_client, domain_context=""):
+    """
+    Memory-aware response generation - conversation history'yi dikkate alan response
+    
+    Args:
+        question: Kullanıcının sorusu
+        context: Document context
+        conversation_context: Konuşma geçmişi
+        openai_client: OpenAI client
+        domain_context: Domain context
+        
+    Returns:
+        Generated response string
+    """
+    # Context kontrolü
+    if not context or len(context.strip()) < 50:
+        print("🚨 Critical: Empty or insufficient context for memory-aware response generation!")
+        
+        if not context or len(context.strip()) < 10:
+            error_msg = f"Bu konuda elimdeki {domain_context.lower() if domain_context else 'belgelerde'} bilgi bulunamadı."
+            if conversation_context:
+                error_msg += " Önceki konuştuklarımızda da bu konuda detay yoktu."
+            return error_msg
+    
+    # Memory-aware prompt template with conditional conversation context
+    conversation_instructions = ""
+    if conversation_context and len(conversation_context.strip()) > 20:
+        conversation_instructions = """
+ÖNCEKİ KONUŞMA BİLGİSİ VAR: Geçmiş konuşmalardaki referansları, bağlantıları ve devam eden konuları dikkate al.
+- "Bu", "şu", "daha önce bahsettiğiniz" gibi referansları doğru yorumla
+- Önceki sorularla bağlantılı cevaplar ver
+- Tutarlılığı koru - önceki cevaplarınla çelişme"""
+    else:
+        conversation_instructions = """
+İLK KONUŞMA: Bu kullanıcıyla ilk etkileşim, önceki konuşma referansı yok.
+- Doğrudan ve kapsamlı yanıt ver
+- "Daha önce" veya "önceki konuşma" ifadeleri kullanma"""
+    
+    memory_aware_template = f"""Sen IntelliDocs platformunun doküman analizi uzmanısın. Kullanıcılarla sürekli konuşan, geçmiş konuşmaları hatırlayan bir asistansın.
+{conversation_instructions}
+
+KRİTİK FORMAT KURALLARI:
+- YALNIZCA düz paragraf metni olarak yanıt ver
+- Hiçbir biçimlendirme karakteri kullanma: *, **, #, -, 1. 2. 3., •, →, ✓ vb. YASAK
+- Kalın yazı, italik, liste, başlık, madde işareti YASAK
+- Sadece virgül, nokta, iki nokta, parantez gibi normal noktalama kullan
+- Doğal akışkan paragraf metni yaz
+
+MEVCUT DOKÜMAN BİLGİLERİ:
+{{context}}
+
+GÖREVLER:
+1. Soruyu anlayırken önceki konuşmalardaki bağlamı da dikkate al
+2. Kaynak referanslarını [Kaynak: ...] formatında ver
+3. Net, anlaşılır ve bağlamsal cevap ver - SADECE DÜZ METİN olarak
+
+🎯 SPESİFİKLİK KURALLARI:
+- "Genel olarak" veya "genellikle" yerine mevcut belgedeki bilgileri doğrudan kullan
+- "Üniversitenizin yönetmeliğine göre değişebilir" yerine belgedeki spesifik bilgileri ver
+- Belirsizlik ifadeleri kullanma, eldeki belgelerden kesin bilgileri aktar
+- "Ankara Bilim Üniversitesi'nde" gibi spesifik ifadeler kullan
+- Detaylı ve kesin bilgiler ver, genel yorumlar yapma
+
+⚠️ TUTARLILIK KONTROLÜ:
+- Sayısal bilgileri (not ortalaması, puan, yüzde vs.) karşılaştırırken dikkatli ol
+- Şartları belirtirken "için gerekli minimum X iken mevcut Y" şeklinde açık karşılaştırma yap
+- Eğer şart sağlanmıyorsa açıkça "hayır" de, sebeplerini belirt
+- Çelişkili bilgi varsa "belgede farklı koşullar belirtiliyor" diye not düş
+- Belirsizlik varsa "kesin bilgi için X belgesi kontrol edilmeli" de
+
+ÖZEL ÖZELLİK - DAHA FAZLA BİLGİ İHTİYACI:
+- Eğer soru belirsizse veya çok genelse, kullanıcıya netleştirici sorular sor
+- Eksik bilgi varsa hangi detayların gerekli olduğunu belirt
+- "Bu konuda size daha iyi yardım edebilmem için şu bilgilere ihtiyacım var..." şeklinde yaklaş
+- Mevcut bilgilerle cevap ver ama ek soru da sor
+
+SORU: {{question}}
+
+DÜZ METİN CEVAP (hiçbir biçimlendirme karakteri kullanmadan):"""
+    
+    # Domain context adaptation
+    if domain_context:
+        adapted_template = memory_aware_template.replace(
+            "Sen IntelliDocs platformunun doküman analizi uzmanısın",
+            f"Sen {domain_context} konusunda uzman bir asistansın"
+        ).replace(
+            "Bu konuda verilen dokümanlarda bilgi bulunamadı",
+            f"Bu konuda verilen {domain_context.lower()} metinlerinde bilgi bulunamadı"
+        )
+    else:
+        adapted_template = memory_aware_template
+    
+    try:
+        print(f"🤖💭 Generating memory-aware response with context length: {len(context)} chars")
+        
+        response = await openai_client.chat.completions.create(
+            model=LLM_MODEL,
+            messages=[{
+                "role": "user", 
+                "content": adapted_template.format(context=context, question=question)
+            }],
+            temperature=0.1,
+            max_tokens=1000
+        )
+        
+        answer = response.choices[0].message.content.strip()
+        
+        # 🚨 CRITICAL: Remove any markdown characters that slipped through
+        # Remove bold/italic markers
+        answer = re.sub(r'\*\*([^*]+)\*\*', r'\1', answer)  # Remove **bold**
+        answer = re.sub(r'\*([^*]+)\*', r'\1', answer)      # Remove *italic*
+        answer = re.sub(r'__([^_]+)__', r'\1', answer)      # Remove __bold__
+        answer = re.sub(r'_([^_]+)_', r'\1', answer)        # Remove _italic_
+        
+        # Remove list markers
+        answer = re.sub(r'^\s*[-•→✓]\s+', '', answer, flags=re.MULTILINE)  # Remove bullet points
+        answer = re.sub(r'^\s*\d+\.\s+', '', answer, flags=re.MULTILINE)   # Remove numbered lists
+        
+        # Remove headers
+        answer = re.sub(r'^#+\s+', '', answer, flags=re.MULTILINE)  # Remove headers
+        
+        # Clean up any double spaces
+        answer = re.sub(r'\s+', ' ', answer).strip()
+        
+        print(f"✅ Memory-aware response generated: {len(answer)} characters")
+        print(f"📝 LLM Response: {answer[:200]}{'...' if len(answer) > 200 else ''}")
+        return answer
+        
+    except Exception as e:
+        print(f"❌ Memory-aware response generation error: {e}")
+        fallback_response = f"Özür dilerim, yanıt oluştururken bir hata oluştu. Lütfen sorunuzu tekrar deneyin."
+        if conversation_context:
+            fallback_response += " Önceki konuşmamızı da dikkate alarak yeniden sorabilirsinin."
+        return fallback_response
+
+
+async def ask_question_with_memory_optimized(question, collection, openai_client, model, cross_encoder_model, 
+                                           conversation_context="", domain_context=""):
+    """
+    🚀💭 SEMANTIC Memory-aware RAG System - AI-driven context detection
+    
+    Modern approach using:
+    - Semantic similarity analysis with embeddings
+    - Context dependency classification  
+    - Intent continuity detection
+    - Dynamic threshold adjustment
+    
+    Args:
+        question: Kullanıcının sorusu
+        collection: Weaviate/ChromaDB collection
+        openai_client: OpenAI client
+        model: Embedding model
+        cross_encoder_model: Cross-encoder model
+        conversation_context: Önceki konuşma geçmişi
+        domain_context: Domain-specific context
+        
+    Returns:
+        (response, sources_metadata): Yanıt ve kaynak metadataları
+    """
+    print(f"\n🚀💭 Processing SEMANTIC memory-aware question: {question}")
+    if conversation_context:
+        print(f"🧠 Available conversation context: {len(conversation_context)} chars")
+    
+    # 🔍 SAME QUALITY CONTROLS AS NORMAL CHAT - Yazım hatası kontrolü
+    corrected_question = _check_and_correct_critical_typos(question)
+    if corrected_question != question:
+        print(f"⚠️ Memory chat yazım hatası tespit edildi ve düzeltildi: '{question}' → '{corrected_question}'")
+        return f"Sorunuzda yazım hatası tespit ettim. '{question}' yerine '{corrected_question}' mi demek istediniz? Lütfen doğru yazımla tekrar deneyin.", []
+    
+    # 🚨 SAME QUALITY CONTROLS AS NORMAL CHAT - Anlamsızlık kontrolü
+    if _is_meaningless_question(question):
+        print(f"🚫 Memory chat anlamsız soru tespit edildi: '{question}'")
+        return "Bu soru anlam ifade etmiyor. Lütfen net ve anlaşılır bir soru sorun.", []
+    
+    # 🧠 SEMANTIC Context Dependency Analysis
+    needs_context, confidence, reason = await _detect_context_dependency_semantic(
+        question, conversation_context, model, is_voice=False
+    )
+    
+    print(f"🎯 Semantic decision: needs_context={needs_context}, confidence={confidence:.3f}, reason={reason}")
+    
+    # Context-enhanced question preprocessing (only if needed)
+    if needs_context:
+        enhanced_question = _enhance_question_with_context(question, conversation_context)
+        use_conversation_context = conversation_context
+        print(f"🔗 Enhanced question with semantic context (added {len(conversation_context)} chars)")
+        print(f"✅ Using context-enhanced processing")
+    else:
+        enhanced_question = question
+        use_conversation_context = ""
+        print(f"🆕 Using independent processing (no context needed)")
+    
+    # 🚀 PHASE 1: Paralel başlangıç işlemleri (conversation-aware)
+    async def memory_phase1_tasks():
+        # Task 1: Context-aware HyDE generation
+        hyde_task = asyncio.create_task(
+            generate_multiple_hyde_variants(enhanced_question, openai_client, domain_context=domain_context)
+        )
+        
+        # Task 2: Question embedding (for ensemble)
+        question_embedding_task = asyncio.create_task(
+            asyncio.to_thread(model.encode, enhanced_question)
+        )
+        
+        return await asyncio.gather(hyde_task, question_embedding_task)
+    
+    # Execute phase 1
+    hyde_variants, question_embedding = await memory_phase1_tasks()
+    print(f"✅ Phase 1 completed: {len(hyde_variants)} HyDE variants generated")
+    
+    # 🚀 PHASE 2: Paralel search ve reranking (memory-enhanced)
+    async def memory_phase2_tasks():
+        # Task 1: Context-enhanced query vector
+        query_vector_task = asyncio.create_task(
+            _create_smart_query_vector_optimized(enhanced_question, hyde_variants, question_embedding, model)
+        )
+        
+        # Wait for query vector, then do search
+        query_vector = await query_vector_task
+        
+        # Task 2: Parallel search operations
+        search_task = asyncio.create_task(
+            _perform_hybrid_search(enhanced_question, query_vector, collection, cross_encoder_model)
+        )
+        
+        return await search_task
+    
+    # Execute phase 2
+    search_results = await memory_phase2_tasks()
+    print(f"✅ Phase 2 completed: {len(search_results)} search results")
+    
+    # 🚀 PHASE 3: Semantic memory-enhanced context ve response generation
+    context = _assemble_memory_enhanced_context(search_results, question, use_conversation_context, domain_context)
+    
+    # Enhanced context information
+    print(f"🧠 Enhanced context with semantic conversation history (+{len(use_conversation_context)} chars)")
+    
+    response = await _generate_memory_aware_response(question, context, use_conversation_context, openai_client, domain_context)
+    
+    # Extract source metadata
+    sources_metadata = []
+    for result in search_results[:10]:
+        metadata = result.get('metadata', {})
+        sources_metadata.append({
+            'source': metadata.get('source', 'Unknown'),
+            'article': metadata.get('article', 'Unknown')
+        })
+    
+    print("🎉 Memory-aware optimized RAG completed!")
+    return response, sources_metadata
+
+
+# Voice-specific memory-aware function
+async def ask_question_voice_with_memory(question, collection, openai_client, model, cross_encoder_model, 
+                                       conversation_context="", domain_context="", request=None):
+    """
+    🎤💭 Voice + Memory-aware RAG sistemi - Ses ve hafıza kombinasyonu
+    
+    Args:
+        question: Kullanıcının sorusu
+        collection: Weaviate/ChromaDB collection
+        openai_client: OpenAI client
+        model: Embedding model
+        cross_encoder_model: Cross-encoder model
+        conversation_context: Önceki konuşma geçmişi
+        domain_context: Domain context
+        request: Request object for disconnection check
+        
+    Returns:
+        (response, sources_metadata): Yanıt ve kaynak metadataları
+    """
+    print(f"\n🎤💭 Processing voice + memory question: {question}")
+    if conversation_context:
+        print(f"🧠 Using conversation context: {len(conversation_context)} chars")
+    
+    # Helper function for checking disconnection
+    async def check_disconnection(step_name):
+        if request and await request.is_disconnected():
+            print(f"🚪 Client disconnected during {step_name}")
+            raise Exception(f"Client disconnected during {step_name}")
+    
+    # 🧠 SEMANTIC Context Dependency Analysis for Voice
+    await check_disconnection("semantic context analysis")
+    
+    needs_context, confidence, reason = await _detect_context_dependency_semantic(
+        question, conversation_context, model, is_voice=True
+    )
+    
+    print(f"🎯 Voice semantic decision: needs_context={needs_context}, confidence={confidence:.3f}")
+    
+    # Enhanced question with context (only if needed)
+    if needs_context:
+        enhanced_question = _enhance_question_with_context(question, conversation_context)
+        use_conversation_context = conversation_context
+    else:
+        enhanced_question = question
+        use_conversation_context = ""
+    
+    await check_disconnection("HyDE generation")
+    hyde_variants = await generate_multiple_hyde_variants(enhanced_question, openai_client, domain_context=domain_context)
+    
+    await check_disconnection("query vector creation")
+    query_vector = await _create_smart_query_vector(enhanced_question, hyde_variants, model)
+    
+    await check_disconnection("hybrid search")
+    initial_results = await _perform_hybrid_search(enhanced_question, query_vector, collection, cross_encoder_model)
+    
+    await check_disconnection("semantic context assembly")
+    context = _assemble_memory_enhanced_context(initial_results, question, use_conversation_context, domain_context)
+    
+    # Voice-specific + semantic memory-aware response
+    await check_disconnection("voice + semantic memory response generation")
+    response = await _generate_voice_memory_response(question, context, use_conversation_context, openai_client, domain_context)
+    
+    # Extract source metadata
+    sources_metadata = []
+    for result in initial_results[:10]:
+        metadata = result.get('metadata', {})
+        sources_metadata.append({
+            'source': metadata.get('source', 'Unknown'),
+            'article': metadata.get('article', 'Unknown')
+        })
+    
+    return response, sources_metadata
+
+
+async def _generate_voice_memory_response(question, context, conversation_context, openai_client, domain_context=""):
+    """
+    Voice + Memory-aware response generation - Hem sesli hem hafızalı
+    
+    Args:
+        question: Kullanıcının sorusu
+        context: Document context
+        conversation_context: Konuşma geçmişi
+        openai_client: OpenAI client
+        domain_context: Domain context
+        
+    Returns:
+        Generated response string
+    """
+    # Convert question to string if it's a list (fix for unhashable type error)
+    if isinstance(question, list):
+        question = ' '.join(str(q) for q in question)
+    else:
+        question = str(question)
+    
+    # Context kontrolü
+    if not context or len(context.strip()) < 50:
+        print("🚨 Critical: Empty or insufficient context for voice + memory response!")
+        
+        if not context or len(context.strip()) < 10:
+            error_msg = f"Bu konuda elimdeki {domain_context.lower() if domain_context else 'belgelerde'} bilgi bulunamadı."
+            if conversation_context:
+                error_msg += " Önceki konuştuklarımızda da bu konuda detay yoktu."
+            return error_msg
+    
+    # Voice + Memory hybrid prompt template with conditional memory instructions
+    if conversation_context and len(conversation_context.strip()) > 20:
+        memory_instructions = """- Önceki konuşmalardaki referansları hatırla
+- Kullanıcının geçmiş sorularıyla bağlantı kur
+- Tutarlı bir sohbet deneyimi sun
+- "Bu", "şu" gibi referansları doğru yorumla
+- "Daha önce de belirttiğim gibi" tarzında bağlayıcılar kullan"""
+    else:
+        memory_instructions = """- Bu ilk konuşma, önceki referans yok
+- Doğrudan ve net yanıt ver
+- "Daha önce" ifadeleri kullanma"""
+    
+    voice_memory_template = """Sen IntelliDocs platformunun sesli asistanısın. Kullanıcılarla doğal konuşma yapan, geçmiş sohbetleri hatırlayan bir asistansın.
+
+SESLİ YANIT KURALLARI:
+- Doğal, akıcı ve konuşma dilinde yanıt ver
+- Kısa ve net cümleler kullan
+- Kaynak referanslarını doğal dile entegre et: "Üniversite burs yönetmeliğine göre..." şeklinde
+- Belge adlarını doğal şekilde bahset: "Burs belgelerinde belirtildiği üzere..."
+
+HAFIZA KURALLARI (SADECE ÖNCEKİ KONUŞMA VARSA):
+{memory_instructions}
+
+🎯 SESLİ SPESİFİKLİK:
+- "Genellikle" yerine "Ankara Bilim Üniversitesi'nde" de
+- "Değişebilir" yerine mevcut belgedeki kesin bilgileri ver
+- Belirsiz ifadeler kullanma, net bilgiler aktar
+- Detaylı ama konuşma diline uygun açıklamalar yap
+
+⚠️ TUTARLILIK KONTROLÜ (Sesli):
+- Sayısal karşılaştırmalarda net ol: "X gerekli, sizinki Y, bu yüzden hayır/evet"
+- Çelişki varsa: "Belgede farklı koşullar var, açıklığa kavuşturalım"
+- Belirsizlik varsa: "Kesin cevap için ek bilgi gerekli"
+- Şart sağlanmıyorsa doğrudan: "Maalesef bu şartları karşılamıyor"
+
+SESLİ SORU SORMA:
+- Belirsiz sorularda: "Hangi konuda daha detay istiyorsunuz?" 
+- Eksik bilgi varsa: "Size daha iyi yardım edebilmem için şunu öğrenebilir miyim..."
+- Çok geniş sorularda: "Bu konuyu hangi açıdan ele alalım?"
+- Doğal ve samimi tonla ek bilgi isteyin
+
+MEVCUT BİLGİLER:
+{context}
+
+SORU: {question}
+
+SESLİ CEVAP:"""
+    
+    # Domain context adaptation
+    if domain_context:
+        adapted_template = voice_memory_template.replace(
+            "Sen IntelliDocs platformunun sesli asistanısın",
+            f"Sen {domain_context} konusunda uzman sesli asistanısın"
+        )
+    else:
+        adapted_template = voice_memory_template
+    
+    try:
+        print(f"🎤🤖💭 Generating voice + memory response with context: {len(context)} chars")
+        
+        response = await openai_client.chat.completions.create(
+            model=LLM_MODEL,
+            messages=[{
+                "role": "user", 
+                "content": adapted_template.format(context=context, question=question)
+            }],
+            temperature=0.15,  # Slightly higher for more natural voice
+            max_tokens=800     # Shorter for voice
+        )
+        
+        answer = response.choices[0].message.content.strip()
+        print(f"✅ Voice + memory response generated: {len(answer)} characters")
+        print(f"📝 Voice LLM Response: {answer[:200]}{'...' if len(answer) > 200 else ''}")
+        return answer
+        
+    except Exception as e:
+        print(f"❌ Voice + memory response generation error: {e}")
+        fallback = "Özür dilerim, yanıt oluştururken sorun yaşadım."
+        if conversation_context:
+            fallback += " Önceki konuşmamızı hatırlıyorum, sorunuzu farklı şekilde sorabilir misiniz?"
+        return fallback
+
+
+async def _detect_context_dependency_semantic(question, conversation_context, model, is_voice=False):
+    """
+    🧠 Semantic-based context dependency detection - Modern AI approach
+    
+    Instead of manual keyword matching, uses:
+    1. Semantic similarity between question and context
+    2. Context dependency classification 
+    3. Intent continuity analysis
+    4. Topic flow detection
+    
+    Args:
+        question: Current user question
+        conversation_context: Previous conversation history
+        model: Embedding model for semantic analysis
+        is_voice: Whether this is a voice interaction (more aggressive memory)
+        
+    Returns:
+        (needs_context: bool, confidence: float, reason: str)
+    """
+    if not conversation_context or len(conversation_context.strip()) < 20:
+        return False, 0.0, "no_previous_context"
+    
+    try:
+        # 1. Extract last few exchanges for analysis
+        context_lines = conversation_context.split('\n')
+        recent_exchanges = []
+        
+        for i in range(len(context_lines)-1, -1, -1):
+            line = context_lines[i].strip()
+            if line.startswith('Kullanıcı:') or line.startswith('Asistan:'):
+                recent_exchanges.append(line)
+                if len(recent_exchanges) >= 6:  # Last 3 exchanges
+                    break
+        
+        if len(recent_exchanges) < 2:
+            return False, 0.0, "insufficient_context"
+        
+        recent_exchanges.reverse()  # Chronological order
+        
+        # 2. Extract recent questions and responses
+        recent_questions = []
+        recent_responses = []
+        
+        for line in recent_exchanges:
+            if line.startswith('Kullanıcı:'):
+                recent_questions.append(line.replace('Kullanıcı:', '').strip())
+            elif line.startswith('Asistan:'):
+                recent_responses.append(line.replace('Asistan:', '').strip())
+        
+        if not recent_questions:
+            return False, 0.0, "no_recent_questions"
+        
+        # 3. Semantic Similarity Analysis
+        print(f"🧠 Semantic analysis: current='{question}' vs recent={len(recent_questions)} questions")
+        
+        # Create embeddings for comparison
+        texts_to_embed = [question] + recent_questions + recent_responses
+        embeddings = await asyncio.to_thread(model.encode, texts_to_embed)
+        
+        question_embedding = embeddings[0]
+        recent_q_embeddings = embeddings[1:len(recent_questions)+1]
+        recent_r_embeddings = embeddings[len(recent_questions)+1:]
+        
+        # Calculate semantic similarities
+        from sklearn.metrics.pairwise import cosine_similarity
+        import numpy as np
+        
+        # Similarity with recent questions (continuation patterns)
+        q_similarities = []
+        for recent_emb in recent_q_embeddings:
+            sim = cosine_similarity([question_embedding], [recent_emb])[0][0]
+            q_similarities.append(sim)
+        
+        # Similarity with recent responses (dependency on answers)
+        r_similarities = []
+        for recent_emb in recent_r_embeddings:
+            sim = cosine_similarity([question_embedding], [recent_emb])[0][0]
+            r_similarities.append(sim)
+        
+        max_q_sim = max(q_similarities) if q_similarities else 0
+        max_r_sim = max(r_similarities) if r_similarities else 0
+        avg_sim = (max_q_sim + max_r_sim) / 2
+        
+        print(f"🔍 Semantic similarities: q_max={max_q_sim:.3f}, r_max={max_r_sim:.3f}, avg={avg_sim:.3f}")
+        
+        # 4. Context Dependency Classification
+        dependency_indicators = await _classify_context_dependency(question, recent_questions, recent_responses)
+        
+        # 5. Combine semantic and structural signals
+        semantic_score = avg_sim
+        dependency_score = dependency_indicators['score']
+        
+        # Weighted final score
+        final_score = (semantic_score * 0.6) + (dependency_score * 0.4)
+        
+        # 🎤 VOICE-SPECIFIC THRESHOLDS - More aggressive memory for voice interactions
+        if is_voice:
+            # Voice users expect more conversational flow - lower thresholds
+            if len(recent_questions) <= 2:
+                threshold = 0.15  # Very aggressive for short voice conversations
+            elif len(recent_questions) <= 4:
+                threshold = 0.22  # Moderately aggressive for medium conversations
+            else:
+                threshold = 0.30  # Still more lenient than text for long conversations
+            print(f"🎤 Using voice-optimized threshold: {threshold}")
+        else:
+            # Standard text thresholds
+            if len(recent_questions) <= 2:
+                threshold = 0.25  # More lenient for short conversations
+            elif len(recent_questions) <= 4:
+                threshold = 0.35  # Standard threshold
+            else:
+                threshold = 0.45  # Stricter for long conversations to prevent drift
+        
+        needs_context = final_score > threshold
+        confidence = final_score
+        
+        reason = f"semantic_analysis(sim={semantic_score:.3f}, dep={dependency_score:.3f}, final={final_score:.3f})"
+        
+        print(f"🎯 Context decision: needs={needs_context}, confidence={confidence:.3f}, reason={reason}")
+        
+        return needs_context, confidence, reason
+        
+    except Exception as e:
+        print(f"❌ Error in semantic context detection: {e}")
+        # Fallback to simple approach
+        return await _fallback_context_detection(question, conversation_context)
+
+
+async def _classify_context_dependency(question, recent_questions, recent_responses):
+    """
+    🔍 Classify context dependency using multiple signals
+    
+    Args:
+        question: Current question
+        recent_questions: List of recent questions
+        recent_responses: List of recent responses
+        
+    Returns:
+        Dict with dependency classification
+    """
+    indicators = {
+        'pronoun_dependency': 0,      # Pronouns referring to previous context
+        'ellipsis_continuation': 0,   # Incomplete questions needing context
+        'topic_continuity': 0,        # Same topic continuation
+        'clarification_request': 0,   # Asking for clarification
+        'comparative_reference': 0,   # Comparing with previous info
+        'score': 0
+    }
+    
+    question_lower = question.lower()
+    question_words = question.split()
+    
+    # 1. Pronoun Dependency Detection (Turkish-specific)
+    turkish_pronouns = {
+        'bu': 0.8, 'şu': 0.8, 'o': 0.6, 'bunlar': 0.9, 'şunlar': 0.9, 'onlar': 0.7,
+        'bunu': 0.8, 'şunu': 0.8, 'onu': 0.6, 'bunları': 0.9, 'şunları': 0.9, 'onları': 0.7,
+        'bunun': 0.8, 'şunun': 0.8, 'onun': 0.6, 'bunların': 0.9, 'şunların': 0.9, 'onların': 0.7
+    }
+    
+    for pronoun, weight in turkish_pronouns.items():
+        if pronoun in question_lower:
+            indicators['pronoun_dependency'] = max(indicators['pronoun_dependency'], weight)
+    
+    # 2. Ellipsis/Incomplete Question Detection
+    question_words_count = len([w for w in question_words if len(w) > 2])
+    if question_words_count <= 3:  # Very short questions
+        if any(word in question_lower for word in ['ne', 'nasıl', 'neden', 'kim', 'nerede', 'ne zaman']):
+            indicators['ellipsis_continuation'] = 0.7
+    
+    # Check for incomplete sentence patterns
+    incomplete_patterns = ['peki', 'ee', 'hani', 'ya', 'ama', 've', 'ayrıca', 'bir de']
+    for pattern in incomplete_patterns:
+        if question.strip().startswith(pattern):
+            indicators['ellipsis_continuation'] = 0.8
+    
+    # 3. Clarification Request Detection
+    clarification_patterns = [
+        'ne demek', 'nasıl yani', 'açar mısın', 'detayını', 'daha fazla', 'örnek',
+        'hangisi', 'hangi', 'kaçıncı', 'nerede', 'ne zaman exactly'
+    ]
+    for pattern in clarification_patterns:
+        if pattern in question_lower:
+            indicators['clarification_request'] = 0.6
+    
+    # 4. Comparative Reference Detection  
+    comparative_words = ['aynı', 'farklı', 'benzer', 'karşı', 'diğer', 'ek', 'ilave', 'başka', 'alternatif']
+    for word in comparative_words:
+        if word in question_lower:
+            indicators['comparative_reference'] = 0.5
+    
+    # 5. Topic Continuity (semantic)
+    if recent_responses:
+        # Extract key terms from recent responses
+        recent_response_text = ' '.join(recent_responses[-2:]).lower()  # Last 2 responses
+        
+        # Simple term overlap
+        response_words = set(recent_response_text.split())
+        question_words_set = set(question_lower.split())
+        
+        overlap = len(response_words.intersection(question_words_set))
+        total_unique = len(response_words.union(question_words_set))
+        
+        if total_unique > 0:
+            topic_similarity = overlap / total_unique
+            indicators['topic_continuity'] = min(topic_similarity * 2, 1.0)  # Scale to 0-1
+    
+    # 6. Calculate final dependency score
+    weights = {
+        'pronoun_dependency': 0.35,      # Highest weight - clear dependency
+        'ellipsis_continuation': 0.25,   # Strong indicator
+        'clarification_request': 0.15,   # Medium indicator
+        'comparative_reference': 0.10,   # Lower weight
+        'topic_continuity': 0.15        # Contextual continuity
+    }
+    
+    final_score = 0
+    for indicator, value in indicators.items():
+        if indicator in weights:
+            final_score += value * weights[indicator]
+    
+    indicators['score'] = final_score
+    
+    print(f"📊 Dependency analysis: {indicators}")
+    return indicators
+
+
+async def _fallback_context_detection(question, conversation_context):
+    """
+    Simple fallback when semantic analysis fails
+    """
+    question_lower = question.lower()
+    
+    # High-confidence indicators
+    if any(word in question_lower for word in ['bu', 'şu', 'o', 'bunları', 'şunları']):
+        return True, 0.8, "fallback_pronoun_detected"
+    
+    # Low-confidence indicators
+    if len(question.split()) <= 3:
+        return True, 0.4, "fallback_short_question"
+    
+    return False, 0.1, "fallback_independent"
+
+
+def _enhance_question_with_context(question, conversation_context):
+    """
+    Soruyu conversation context ile zenginleştir - SEMANTIC VERSION
+    
+    Args:
+        question: Orijinal soru
+        conversation_context: Konuşma geçmişi
+        
+    Returns:
+        Enhanced question string
+    """
+    if not conversation_context or len(conversation_context.strip()) < 10:
+        return question
+    
+    # Bu fonksiyon artık semantic analysis sonucu çağrılır
+    # Context'in alakalı olduğu zaten belirlendi
+    context_lines = conversation_context.split('\n')
+    
+    # Smart context window - son birkaç exchange
+    if len(context_lines) > 8:
+        recent_context = '\n'.join(context_lines[-8:])
+    else:
+        recent_context = conversation_context
+    
+    enhanced = f"""Önceki konuşma bağlamı:
+{recent_context}
+
+Şu anki soru: {question}"""
+    
+    print(f"🔗 Enhanced question with semantic context (added {len(recent_context)} chars)")
+    return enhanced
+
+
+def _assemble_memory_enhanced_context(results, question, conversation_context, domain_context=""):
+    """
+    Memory-enhanced context assembly - SEMANTIC VERSION
+    
+    Args:
+        results: Arama sonuçları
+        question: Kullanıcının sorusu
+        conversation_context: Konuşma geçmişi
+        domain_context: Domain context
+        
+    Returns:
+        Enhanced context string
+    """
+    if not results:
+        return ""
+    
+    # Normal context assembly
+    base_context = _assemble_optimized_context(results, question, domain_context)
+    
+    # Memory enhancement - semantic context zaten relevance check'ten geçti
+    if conversation_context and len(conversation_context.strip()) > 20:
+        # Context'i dahil et - çünkü semantic analysis onayladı
+        context_lines = conversation_context.split('\n')
+        
+        # Smart windowing
+        if len(context_lines) > 6:
+            summary_context = '\n'.join(context_lines[-6:])  # Son 3 exchange
+        else:
+            summary_context = conversation_context
+        
+        enhanced_context = f"""GEÇMIŞ KONUŞMA:
+{summary_context}
+
+İLGİLİ DOKÜMAN BİLGİLERİ:
+{base_context}"""
+        
+        print(f"🧠 Enhanced context with semantic conversation history (+{len(summary_context)} chars)")
+        return enhanced_context
+    
+    return base_context
