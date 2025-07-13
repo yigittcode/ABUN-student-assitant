@@ -284,8 +284,7 @@ class ResponseGenerator:
                 
             if found_topics:
                 print(f"   ⚠️ Context contains information about: {found_topics}")
-                print("   🔧 This indicates a prompt engineering issue!")
-            # Could trigger alternative generation here if needed
+                print("   🔧 This indicates a search/ranking algorithmic issue!")
         
         return response
     

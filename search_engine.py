@@ -16,6 +16,94 @@ class SearchEngine:
     
     def __init__(self, cross_encoder_model=None):
         self.cross_encoder_model = cross_encoder_model
+        
+        # Domain-specific query expansion patterns for Turkish university content
+        self.query_expansions = {
+            'ortak dersler': [
+                'ortak zorunlu dersler',
+                'atatürk ilkeleri ve inkılap tarihi',
+                'türk dili',
+                'yabancı dil',
+                'temel bilimler dersleri',
+                'matematik fizik kimya biyoloji',
+                'ortak koordinatörlük'
+            ],
+            'burs': [
+                'burs türleri',
+                'başarı bursu',
+                'ihtiyaç bursu', 
+                'ösym bursu',
+                'tam burslu',
+                'kısmi burslu',
+                'indirim oranları'
+            ],
+            'yurt': [
+                'öğrenci yurdu',
+                'anlaşmalı yurtlar',
+                'barınma imkanları',
+                'konaklama seçenekleri',
+                'yurt fiyatları',
+                'yurt başvuru'
+            ],
+            'kayıt': [
+                'öğrenci kayıt',
+                'kayıt yenileme',
+                'akademik kayıt',
+                'ders kayıt',
+                'kayıt işlemleri',
+                'kayıt tarihleri'
+            ],
+            'sınav': [
+                'final sınavı',
+                'ara sınav',
+                'sınav tarihleri',
+                'sınav sistemi',
+                'değerlendirme kriterleri',
+                'not sistemi'
+            ]
+        }
+    
+    def _expand_query_terms(self, query: str) -> List[str]:
+        """Expand query with domain-specific terms"""
+        
+        query_lower = query.lower()
+        expanded_terms = [query]  # Always include original
+        
+        # Check for expansion patterns
+        for key_pattern, expansions in self.query_expansions.items():
+            if key_pattern in query_lower:
+                print(f"   🔍 Expanding '{key_pattern}' with {len(expansions)} domain terms")
+                expanded_terms.extend(expansions)
+        
+        # Additional intelligent expansions based on query content
+        if 'birinci sınıf' in query_lower and 'ders' in query_lower:
+            expanded_terms.extend([
+                'zorunlu dersler',
+                'ortak zorunlu dersler',
+                'müfredat dersleri',
+                'temel eğitim dersleri'
+            ])
+            
+        if 'çekilme' in query_lower or 'bırakma' in query_lower:
+            expanded_terms.extend([
+                'ders çekilme',
+                'dersten çekilme',
+                'kayıt iptal',
+                'ders bırakma koşulları'
+            ])
+        
+        # Remove duplicates while preserving order
+        unique_expansions = []
+        seen = set()
+        for term in expanded_terms:
+            if term.lower() not in seen:
+                seen.add(term.lower())
+                unique_expansions.append(term)
+        
+        if len(unique_expansions) > 1:
+            print(f"   📝 Query expanded from 1 to {len(unique_expansions)} terms")
+            
+        return unique_expansions[:8]  # Limit to prevent overload
     
     async def execute_multi_search(self, queries: List[str], query_vectors: List[np.ndarray], 
                                  collection, use_reranking: bool = True) -> List[Dict]:
@@ -56,7 +144,7 @@ class SearchEngine:
     
     async def _perform_single_hybrid_search(self, question: str, query_vector: Optional[np.ndarray], 
                                           collection) -> List[Dict]:
-        """Perform hybrid search for a single query with caching"""
+        """Perform enhanced hybrid search with query expansion for better coverage"""
         
         # Create cache key
         vector_hash = hash(tuple(query_vector.tolist())) if query_vector is not None else "no_vector"
@@ -66,36 +154,62 @@ class SearchEngine:
         if cache_key in search_cache:
             return search_cache[cache_key]
         
+        print(f"🔍 Enhanced hybrid search for: '{question}'")
+        
+        # Step 1: Expand query terms for better coverage
+        expanded_queries = self._expand_query_terms(question)
+        
         db_type = self._detect_db_type(collection)
         
-        # Execute semantic and keyword search in parallel
+        # Step 2: Execute semantic and keyword search in parallel for all expanded terms
         search_tasks = []
         
+        # Original semantic search with query vector
         if query_vector is not None:
             if db_type == 'weaviate':
                 search_tasks.append(self._weaviate_semantic_search(query_vector, collection))
             else:
                 search_tasks.append(self._chroma_semantic_search(query_vector, collection))
         
+        # Keyword search for original query
         if db_type == 'weaviate':
             search_tasks.append(self._weaviate_keyword_search(question, collection))
         else:
             search_tasks.append(self._keyword_search(question, collection))
         
-        # Execute searches
-        if len(search_tasks) == 2:
-            semantic_results, keyword_results = await asyncio.gather(*search_tasks)
-        else:
-            # Only keyword search
-            keyword_results = await search_tasks[0]
-            semantic_results = {'documents': [[]], 'metadatas': [[]], 'distances': [[]]}
+        # Additional keyword searches for expanded terms (if any)
+        if len(expanded_queries) > 1:
+            print(f"   🔎 Performing {len(expanded_queries)-1} additional expansion searches")
+            for expanded_query in expanded_queries[1:]:  # Skip original query
+                if db_type == 'weaviate':
+                    search_tasks.append(self._weaviate_keyword_search(expanded_query, collection))
+                else:
+                    search_tasks.append(self._keyword_search(expanded_query, collection))
         
-        # Combine results
-        combined_results = self._combine_search_results(semantic_results, keyword_results)
+        # Execute all searches in parallel
+        search_results = await asyncio.gather(*search_tasks)
+        
+        # Step 3: Combine results from all searches
+        combined_semantic = search_results[0] if query_vector is not None else {'documents': [[]], 'metadatas': [[]], 'distances': [[]]}
+        
+        # Combine all keyword results
+        all_keyword_results = {'documents': [[]], 'metadatas': [[]]}
+        
+        start_idx = 1 if query_vector is not None else 0
+        for keyword_result in search_results[start_idx:]:
+            if keyword_result['documents'] and keyword_result['documents'][0]:
+                all_keyword_results['documents'][0].extend(keyword_result['documents'][0])
+                all_keyword_results['metadatas'][0].extend(keyword_result['metadatas'][0])
+        
+        # Step 4: Enhanced result combination with expansion boost
+        combined_results = self._combine_search_results_with_expansion(
+            combined_semantic, all_keyword_results, len(expanded_queries) - 1
+        )
         
         # Cache results
         search_cache[cache_key] = combined_results
         
+        print(f"   ✅ Enhanced search completed: {len(combined_results)} results")
         return combined_results
     
     def _detect_db_type(self, collection):
@@ -289,3 +403,53 @@ class SearchEngine:
                 print("🚀 Skipping re-ranking (clear ranking detected)")
         
         return results[:15] 
+
+    def _combine_search_results_with_expansion(self, semantic_results: Dict, keyword_results: Dict, 
+                                             expansion_count: int) -> List[Dict]:
+        """Enhanced result combination that boosts scores for expansion matches"""
+        combined, seen_docs = [], set()
+        
+        # Add semantic results first (highest priority)
+        if semantic_results['documents'] and semantic_results['documents'][0]:
+            for i, doc in enumerate(semantic_results['documents'][0]):
+                doc_key = doc[:100]  # Use first 100 chars as key
+                if doc_key not in seen_docs and doc.strip():
+                    score = 1.0 - semantic_results['distances'][0][i]
+                    combined.append({
+                        'document': doc,
+                        'metadata': semantic_results['metadatas'][0][i],
+                        'score': score,
+                        'source': 'semantic'
+                    })
+                    seen_docs.add(doc_key)
+        
+        # Add keyword results with expansion awareness
+        if keyword_results['documents'] and keyword_results['documents'][0]:
+            for i, doc in enumerate(keyword_results['documents'][0]):
+                doc_key = doc[:100]
+                if doc_key not in seen_docs and doc.strip():
+                    # Base score for keyword matches
+                    base_score = 0.6
+                    
+                    # Boost score if we had query expansions (indicates specialized search)
+                    if expansion_count > 0:
+                        expansion_boost = min(0.2, expansion_count * 0.05)  # Up to 20% boost
+                        final_score = base_score + expansion_boost
+                    else:
+                        final_score = base_score
+                    
+                    combined.append({
+                        'document': doc,
+                        'metadata': keyword_results['metadatas'][0][i],
+                        'score': final_score,
+                        'source': f'keyword{"_expanded" if expansion_count > 0 else ""}'
+                    })
+                    seen_docs.add(doc_key)
+        
+        # Sort by enhanced score
+        combined.sort(key=lambda x: x['score'], reverse=True)
+        
+        if expansion_count > 0:
+            print(f"   🎯 Applied expansion boost to {len([r for r in combined if 'expanded' in r['source']])} results")
+        
+        return combined 

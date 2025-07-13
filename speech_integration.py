@@ -10,31 +10,28 @@ import pygame
 import tempfile
 import os
 import shutil
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from pathlib import Path
+import torch
 
 class SpeechProcessor:
-    """Speech işlemlerini yapan ana sınıf"""
+    """Ses işleme sınıfı - STT ve TTS"""
     
     def __init__(self, whisper_model_name: str = "small"):
-        """
-        Speech Processor başlatma
-        
-        Args:
-            whisper_model_name: Whisper model adı (tiny, base, small, medium, large)
-        """
         print("🎤 Speech Processor başlatılıyor...")
+        self.temp_files: List[str] = []
+        
+        # Force Whisper to use CPU to prevent CUDA OOM
+        print("🤖 Whisper modeli CPU'da yükleniyor...")
+        device = "cpu"  # Force CPU usage
+        self.whisper_model = whisper.load_model(whisper_model_name, device=device)
+        print(f"✅ Whisper {whisper_model_name} modeli CPU'da yüklendi")
+        
+        # TTS için Azure Speech Service kullanacağız
+        self.tts_available = True
         
         # Pygame başlat (TTS için)
         pygame.mixer.init()
-        
-        # Whisper modeli yükle
-        print(f"🤖 Whisper {whisper_model_name} modeli yükleniyor...")
-        self.whisper_model = whisper.load_model(whisper_model_name)
-        print("✅ Whisper hazır!")
-        
-        # Geçici dosya listesi
-        self.temp_files = []
         
         # Türkçe ses seçenekleri
         self.turkish_voices = {
