@@ -200,18 +200,6 @@ Kesinlikle sadece JSON formatında yanıt ver:
         print(f"   Original query: '{original_query}'")
         print(f"   User context: {user_context}")
         
-        # Generate paraphrases
-        paraphrases_task = self._generate_paraphrases(original_query)
-        
-        # Generate domain variants
-        domain_variants_task = self._generate_domain_variants(original_query)
-        
-        # Generate context variants
-        context_variants_task = self._generate_context_variants(original_query, user_context)
-        
-        # Generate question type variants
-        type_variants_task = self._generate_type_variants(original_query)
-        
         # Smart performance optimization based on query complexity
         is_likely_complex = (
             len(original_query.split()) > 8 or 
@@ -222,16 +210,28 @@ Kesinlikle sadece JSON formatında yanıt ver:
         
         if is_likely_complex:
             # Full variant generation for complex queries (quality priority)
+            print(f"   🔍 Full variant generation: {len(original_query.split())} words")
+            
+            # Generate all variants in parallel
+            paraphrases_task = self._generate_paraphrases(original_query)
+            domain_variants_task = self._generate_domain_variants(original_query)
+            context_variants_task = self._generate_context_variants(original_query, user_context)
+            type_variants_task = self._generate_type_variants(original_query)
+            
             paraphrases, domain_variants, context_variants, type_variants = await asyncio.gather(
                 paraphrases_task,
                 domain_variants_task, 
                 context_variants_task,
                 type_variants_task
             )
-            print(f"   🔍 Full variant generation: {len(original_query.split())} words")
         else:
             # Lightweight generation for simple queries (speed priority)
             print(f"   ⚡ Lightweight variant generation: {len(original_query.split())} words")
+            
+            # Only generate domain and type variants for simple queries
+            domain_variants_task = self._generate_domain_variants(original_query)
+            type_variants_task = self._generate_type_variants(original_query)
+            
             domain_variants, type_variants = await asyncio.gather(
                 domain_variants_task,
                 type_variants_task

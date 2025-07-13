@@ -28,6 +28,35 @@ class SearchEngine:
                 'matematik fizik kimya biyoloji',
                 'ortak koordinatörlük'
             ],
+            'rektör': [
+                'rektör',
+                'üniversite rektörü', 
+                'rektörlük',
+                'üniversite başkanı',
+                'yönetim kurulu başkanı',
+                'akademik yönetim',
+                'prof dr',
+                'dekan',
+                'rektörüdür',
+                'yavuz demir',
+                'prof yavuz',
+                'rektörü kimdir',
+                'rektörü kim',
+                'özgeçmiş',
+                'görev yaptığı',
+                'atanan prof',
+                'görevde',
+                'başkan'
+            ],
+            'yönetim': [
+                'rektör',
+                'rektörlük',
+                'yönetim kurulu',
+                'senato',
+                'mütevelli heyet',
+                'dekan',
+                'başkan'
+            ],
             'burs': [
                 'burs türleri',
                 'başarı bursu',
@@ -304,10 +333,17 @@ class SearchEngine:
             for i, doc in enumerate(semantic_results['documents'][0]):
                 doc_key = doc[:100]  # Use first 100 chars as key
                 if doc_key not in seen_docs and doc.strip():
+                    score = 1.0 - semantic_results['distances'][0][i]
+                    
+                    # Apply biographical content boost
+                    if self._contains_biographical_info(doc):
+                        score *= 1.4  # 40% boost for biographical content
+                        print(f"   📊 Applied biographical boost to semantic result (score: {score:.3f})")
+                    
                     combined.append({
                         'document': doc,
                         'metadata': semantic_results['metadatas'][0][i],
-                        'score': 1.0 - semantic_results['distances'][0][i],
+                        'score': score,
                         'source': 'semantic'
                     })
                     seen_docs.add(doc_key)
@@ -317,10 +353,17 @@ class SearchEngine:
             for i, doc in enumerate(keyword_results['documents'][0]):
                 doc_key = doc[:100]
                 if doc_key not in seen_docs and doc.strip():
+                    score = 0.6  # Fixed score for keyword matches
+                    
+                    # Apply biographical content boost
+                    if self._contains_biographical_info(doc):
+                        score *= 1.4  # 40% boost for biographical content
+                        print(f"   📊 Applied biographical boost to keyword result (score: {score:.3f})")
+                    
                     combined.append({
                         'document': doc,
                         'metadata': keyword_results['metadatas'][0][i],
-                        'score': 0.6,  # Fixed score for keyword matches
+                        'score': score,
                         'source': 'keyword'
                     })
                     seen_docs.add(doc_key)
@@ -328,6 +371,50 @@ class SearchEngine:
         # Sort by score
         combined.sort(key=lambda x: x['score'], reverse=True)
         return combined
+    
+    def _contains_biographical_info(self, doc: str) -> bool:
+        """Check if document contains biographical information rather than procedural references"""
+        doc_lower = doc.lower()
+        
+        # Biographical indicators
+        biographical_indicators = [
+            'rektörüdür',           # "is the rector"
+            'özgeçmiş',             # "biography"
+            'doğdu',                # "was born"
+            'atanan prof',          # "appointed professor"
+            'görev yaptığı',        # "served at"
+            'prof dr',              # "Prof. Dr."
+            'yavuz',                # rector's name
+            'demir',                # rector's name
+            'manchester',           # university where he studied
+            'oxford',               # university where he worked
+            'samsun',               # birthplace
+            'kitap',                # "book" (publications)
+            'makale',               # "article" (publications)
+            'tamamladı',            # "completed"
+            'yılında',              # "in year"
+            'haziran',              # "June" (appointment month)
+            'bilim üniversitesi rektörü olarak'  # "as rector of science university"
+        ]
+        
+        # Procedural indicators (lower priority)
+        procedural_indicators = [
+            'yürütür',              # "executes"
+            'hükümlerini',          # "provisions"
+            'yönerge',              # "directive"
+            'yönetmelik',           # "regulation"
+            'madde',                # "article" (legal)
+            'bu kanun',             # "this law"
+            'usul',                 # "procedure"
+            'esaslar',              # "principles"
+        ]
+        
+        # Count biographical vs procedural indicators
+        biographical_score = sum(1 for indicator in biographical_indicators if indicator in doc_lower)
+        procedural_score = sum(1 for indicator in procedural_indicators if indicator in doc_lower)
+        
+        # Boost if biographical content is dominant
+        return biographical_score > procedural_score or biographical_score >= 2
     
     def _combine_multi_search_results(self, all_results: List[List[Dict]]) -> List[Dict]:
         """Combine results from multiple searches with intelligent deduplication"""
@@ -415,6 +502,12 @@ class SearchEngine:
                 doc_key = doc[:100]  # Use first 100 chars as key
                 if doc_key not in seen_docs and doc.strip():
                     score = 1.0 - semantic_results['distances'][0][i]
+                    
+                    # Apply biographical content boost
+                    if self._contains_biographical_info(doc):
+                        score *= 1.4  # 40% boost for biographical content
+                        print(f"   📊 Applied biographical boost to semantic result (score: {score:.3f})")
+                    
                     combined.append({
                         'document': doc,
                         'metadata': semantic_results['metadatas'][0][i],
@@ -437,6 +530,11 @@ class SearchEngine:
                         final_score = base_score + expansion_boost
                     else:
                         final_score = base_score
+                    
+                    # Apply biographical content boost
+                    if self._contains_biographical_info(doc):
+                        final_score *= 1.4  # 40% boost for biographical content
+                        print(f"   📊 Applied biographical boost to keyword result (score: {final_score:.3f})")
                     
                     combined.append({
                         'document': doc,

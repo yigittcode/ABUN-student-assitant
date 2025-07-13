@@ -28,8 +28,26 @@ class AdvancedHydeGenerator:
         'factual': {
             'keywords': ['nedir', 'ne', 'what', 'kimdir', 'tanım', 'definition', 'açıkla', 'explain'],
             'patterns': [r'\bnedir\b', r'\bwhat\s+is\b'],
-            'prompt_tr': "Bu soruya net tanım ve açıklama vererek yanıt ver:",
-            'prompt_en': "Answer this with clear definition and explanation:"
+            'prompt_tr': """Bu soruya GENEL tanım ve açıklama vererek yanıt ver. 
+
+ÖNEMLI KURALLAR:
+- SPESİFİK İSİMLER, TARİHLER, SAYILAR ÜRETMEYİN
+- Gerçek kişi adları, organizasyon isimleri, kesin tarihler YAZMAYIN  
+- Genel kavramsal açıklama yapın
+- "Bu kişi...", "Bu kurum..." gibi genel ifadeler kullanın
+- Örnek: "Rektör, üniversitenin en üst düzey yöneticisidir" gibi
+
+Bu yaklaşımla yanıt ver:""",
+            'prompt_en': """Answer this with general definition and explanation.
+
+IMPORTANT RULES:
+- DO NOT GENERATE SPECIFIC NAMES, DATES, NUMBERS
+- Do not write real person names, organization names, exact dates
+- Provide general conceptual explanation
+- Use general terms like "This person...", "This institution..."
+- Example: "A rector is the top-level administrator of a university"
+
+Answer with this approach:"""
         },
         'procedural': {
             'keywords': ['nasıl', 'how', 'adım', 'step', 'yöntem', 'method', 'prosedür', 'procedure'],
