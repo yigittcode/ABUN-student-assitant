@@ -132,11 +132,24 @@ class SemanticDocumentProcessor:
         chunks = []
         lines = text.split('\n')
         
-        # Primary structure: sections or articles
-        primary_markers = structure['sections'] if structure['sections'] else structure['articles']
+        # Smart primary structure selection
+        sections = structure['sections']
+        articles = structure['articles']
         
-        if not primary_markers:
+        # If we have many articles but few sections, prefer articles
+        if len(articles) > len(sections) * 3:
+            primary_markers = articles
+            structure_type = 'article'
+        elif sections:
+            primary_markers = sections
+            structure_type = 'section'
+        elif articles:
+            primary_markers = articles
+            structure_type = 'article'
+        else:
             return self._create_content_based_chunks(text)
+        
+        print(f"📊 Using {structure_type} markers: {len(primary_markers)} items")
         
         for i, (line_idx, marker_text) in enumerate(primary_markers):
             # Determine chunk boundaries
@@ -159,10 +172,11 @@ class SemanticDocumentProcessor:
             if len(section_text) > MAX_CHARS_PER_CHUNK * 1.5:
                 sub_chunks = self._split_large_section(section_text, marker_text)
                 chunks.extend(sub_chunks)
+                print(f"📄 Split large {structure_type}: {marker_text[:50]}... into {len(sub_chunks)} sub-chunks")
             else:
                 chunks.append({
                     'content': section_text,
-                    'structure_type': 'section' if structure['sections'] else 'article',
+                    'structure_type': structure_type,
                     'title': marker_text,
                     'hierarchy_level': 1
                 })
@@ -170,45 +184,105 @@ class SemanticDocumentProcessor:
         return chunks
     
     def _split_large_section(self, text: str, title: str) -> List[Dict]:
-        """Split large sections into smaller semantic chunks"""
+        """Split large sections into smaller semantic chunks with multiple strategies"""
         chunks = []
         
-        # Try to split by paragraphs first
+        # Strategy 1: Try paragraph-based splitting first
         paragraphs = text.split('\n\n')
         
-        current_chunk = ""
-        chunk_count = 1
+        # If we have many paragraphs, use paragraph-based splitting
+        if len(paragraphs) > 3:
+            current_chunk = ""
+            chunk_count = 1
+            
+            for paragraph in paragraphs:
+                paragraph = paragraph.strip()
+                if not paragraph:
+                    continue
+                
+                # Check if adding this paragraph would exceed limit
+                potential_chunk = current_chunk + '\n\n' + paragraph if current_chunk else paragraph
+                
+                if len(potential_chunk) > MAX_CHARS_PER_CHUNK and current_chunk:
+                    # Save current chunk
+                    chunks.append({
+                        'content': current_chunk.strip(),
+                        'structure_type': 'subsection',
+                        'title': f"{title} (Bölüm {chunk_count})",
+                        'hierarchy_level': 2
+                    })
+                    
+                    current_chunk = paragraph
+                    chunk_count += 1
+                else:
+                    current_chunk = potential_chunk
+            
+            # Add final chunk
+            if current_chunk.strip():
+                chunks.append({
+                    'content': current_chunk.strip(),
+                    'structure_type': 'subsection', 
+                    'title': f"{title} (Bölüm {chunk_count})",
+                    'hierarchy_level': 2
+                })
         
-        for paragraph in paragraphs:
-            paragraph = paragraph.strip()
-            if not paragraph:
-                continue
+        # Strategy 2: If paragraphs didn't work well, try sentence-based splitting
+        if not chunks or any(len(chunk['content']) > MAX_CHARS_PER_CHUNK * 1.2 for chunk in chunks):
+            print(f"⚠️ Paragraph splitting failed for {title[:50]}..., trying sentence-based")
+            chunks = []
             
-            # Check if adding this paragraph would exceed limit
-            potential_chunk = current_chunk + '\n\n' + paragraph if current_chunk else paragraph
+            # Split by sentences
+            import re
+            sentences = re.split(r'(?<=[.!?])\s+', text)
             
-            if len(potential_chunk) > MAX_CHARS_PER_CHUNK and current_chunk:
-                # Save current chunk
+            current_chunk = ""
+            chunk_count = 1
+            
+            for sentence in sentences:
+                sentence = sentence.strip()
+                if not sentence:
+                    continue
+                
+                # Check if adding this sentence would exceed limit
+                potential_chunk = current_chunk + ' ' + sentence if current_chunk else sentence
+                
+                if len(potential_chunk) > MAX_CHARS_PER_CHUNK and current_chunk:
+                    # Save current chunk
+                    chunks.append({
+                        'content': current_chunk.strip(),
+                        'structure_type': 'subsection',
+                        'title': f"{title} (Bölüm {chunk_count})",
+                        'hierarchy_level': 2
+                    })
+                    
+                    current_chunk = sentence
+                    chunk_count += 1
+                else:
+                    current_chunk = potential_chunk
+            
+            # Add final chunk
+            if current_chunk.strip():
                 chunks.append({
                     'content': current_chunk.strip(),
                     'structure_type': 'subsection',
                     'title': f"{title} (Bölüm {chunk_count})",
                     'hierarchy_level': 2
                 })
-                
-                current_chunk = paragraph
-                chunk_count += 1
-            else:
-                current_chunk = potential_chunk
         
-        # Add final chunk
-        if current_chunk.strip():
-            chunks.append({
-                'content': current_chunk.strip(),
-                'structure_type': 'subsection', 
-                'title': f"{title} (Bölüm {chunk_count})",
-                'hierarchy_level': 2
-            })
+        # Strategy 3: If sentence splitting still creates large chunks, use RecursiveCharacterTextSplitter
+        if not chunks or any(len(chunk['content']) > MAX_CHARS_PER_CHUNK * 1.2 for chunk in chunks):
+            print(f"⚠️ Sentence splitting failed for {title[:50]}..., using character-based splitting")
+            
+            fallback_chunks = self.text_splitter.split_text(text)
+            chunks = []
+            
+            for i, chunk_text in enumerate(fallback_chunks):
+                chunks.append({
+                    'content': chunk_text,
+                    'structure_type': 'subsection',
+                    'title': f"{title} (Bölüm {i+1})",
+                    'hierarchy_level': 2
+                })
         
         return chunks
     
