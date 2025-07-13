@@ -162,13 +162,7 @@ async def generate_enhanced_hyde(question, client, domain_context=""):
         return [question]
 
 
-# Backward compatibility için - yeni gelişmiş sistemi kullan
+# Main API function
 async def generate_multiple_hyde_variants(question, client, domain_context=""):
-    """Ana API - gelişmiş HyDE sistemi"""
+    """Enhanced HyDE system - main API"""
     return await generate_enhanced_hyde(question, client, domain_context)
-
-
-async def generate_hypothetical_answers(question, client, n=1, domain_context=""):
-    """Eski API ile uyumlu wrapper"""
-    result = await generate_enhanced_hyde(question, client, domain_context)
-    return result if result else [question]  # Fallback eklendi

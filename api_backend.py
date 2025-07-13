@@ -10,6 +10,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import List, Dict, Optional, Any, Annotated
 import weaviate
+from weaviate.classes.data import DataObject
 from openai import AsyncOpenAI
 from sentence_transformers import SentenceTransformer, CrossEncoder
 import uvicorn
@@ -30,7 +31,8 @@ from config import (
     MONGODB_URL, MONGODB_DB_NAME, MONGODB_COLLECTION_NAME, JWT_SECRET_KEY, JWT_ALGORITHM, 
     JWT_EXPIRE_MINUTES, ADMIN_EMAIL, ADMIN_PASSWORD, PERSISTENT_COLLECTION_NAME
 )
-from rag_engine import ask_question, ask_question_stream, ask_question_voice, create_optimized_embeddings
+# Import the new modular RAG system
+from rag_orchestrator import ask_question, ask_question_stream, ask_question_voice, create_optimized_embeddings
 from document_processor import load_and_process_documents
 from mongodb_manager import MongoDBManager
 from speech_integration import SpeechProcessor
@@ -919,142 +921,35 @@ async def process_uploaded_documents(temp_dir: str, uploaded_files: List[str]):
             logger.info(f"🧹 Cleaned up temporary directory: {temp_dir}")
 
 async def process_uploaded_documents_with_progress(session_id: str, temp_dir: str, uploaded_files: List[str]):
-    """Process uploaded documents with progress tracking"""
-    global weaviate_client, openai_client, embedding_model, cross_encoder_model, mongodb_manager
+    """Optimized document processing with parallel operations and progress tracking"""
+    global weaviate_client, embedding_model, mongodb_manager
     
-    logger.info(f"📦 Starting document processing for session: {session_id}")
+    logger.info(f"📦 Starting optimized document processing for session: {session_id}")
     
     try:
-        # Get persistent collection
         collection = weaviate_client.collections.get(PERSISTENT_COLLECTION_NAME)
         
-        for filename in uploaded_files:
-            try:
-                logger.info(f"🔄 Processing file: {filename}")
-                
-                # Update status to processing
-                mongodb_manager.update_upload_progress(session_id, filename, "processing")
-                
-                file_path = os.path.join(temp_dir, filename)
-                
-                # Load and process the document
-                documents_data = load_and_process_documents(temp_dir, specific_files=[filename])
-                
-                if not documents_data:
-                    # Mark as failed
-                    mongodb_manager.update_upload_progress(
-                        session_id, filename, "failed", 
-                        error_message="Failed to extract content from PDF"
-                    )
-                    continue
-                
-                # Read file for storage (keep in memory)
-                with open(file_path, 'rb') as file:
-                    file_content = file.read()
-                
-                # Step 1: Create embeddings FIRST
-                logger.info(f"🚀 Step 1/3: Creating embeddings for {filename}...")
-                embeddings = await create_optimized_embeddings(documents_data, embedding_model)
-                
-                # Step 2: Add to Weaviate BEFORE MongoDB (so search is ready)
-                logger.info(f"💾 Step 2/3: Adding to vector database for {filename}...")
-                from weaviate.classes.data import DataObject
-                data_objects = []
-                
-                # Generate temporary document_id for Weaviate (will be replaced later)
-                temp_doc_id = f"temp_{session_id}_{filename}"
-                
-                for i, (doc, embedding) in enumerate(zip(documents_data, embeddings)):
-                    try:
-                        # Add document metadata with temp ID
-                        doc_properties = dict(doc)
-                        doc_properties["document_id"] = temp_doc_id
-                        doc_properties["chunk_index"] = i
-                        doc_properties["filename"] = filename  # Add filename for later reference
-                        
-                        data_objects.append(DataObject(
-                            properties=doc_properties, 
-                            vector=embedding
-                        ))
-                    except Exception as e:
-                        logger.warning(f"⚠️ Failed to prepare chunk {i} for {filename}: {e}")
-                
-                # Batch insert to Weaviate
-                if data_objects:
-                    collection.data.insert_many(data_objects)
-                    logger.info(f"✅ Added {len(data_objects)} chunks to Weaviate for {filename}")
-                
-                # Step 3: Store in MongoDB ONLY after everything is ready
-                logger.info(f"📑 Step 3/3: Storing document metadata for {filename}...")
-                doc_id = mongodb_manager.store_document(
-                    file_name=filename,
-                    file_content=file_content,
-                    metadata={"processed_at": datetime.now().isoformat()},
-                    status="processed"  # Set to processed immediately since everything is ready
-                )
-                
-                # Store chunks in MongoDB
-                chunks_count = mongodb_manager.store_document_chunks(doc_id, documents_data)
-                
-                # Update Weaviate chunks with real document_id
-                try:
-                    from weaviate.classes.query import Filter
-                    # Get objects that match our temp_doc_id and update them
-                    objects_updated = 0
-                    
-                    # Use simpler approach - update all objects with temp_doc_id
-                    # Since we know the temp_doc_id pattern, we can update directly
-                    batch_size = 100
-                    updated_count = 0
-                    
-                    # Get all objects in batches and check for temp_doc_id
-                    try:
-                        all_objects = collection.query.fetch_objects(
-                            limit=1000,
-                            return_properties=["document_id", "chunk_index", "filename"]
-                        )
-                        
-                        # Filter and update objects that match our temp_doc_id
-                        for obj in all_objects.objects:
-                            if obj.properties.get("document_id") == temp_doc_id:
-                                collection.data.update(
-                                    uuid=obj.uuid,
-                                    properties={"document_id": doc_id}
-                                )
-                                updated_count += 1
-                        
-                        logger.info(f"🔄 Updated {updated_count} Weaviate chunks with real document_id: {doc_id}")
-                    
-                    except Exception as update_error:
-                        logger.warning(f"⚠️ Could not update Weaviate document_ids: {update_error}")
-                        logger.info(f"✅ Document stored successfully in Weaviate with temp_doc_id: {temp_doc_id}")
-                        
-                except Exception as weaviate_error:
-                    logger.error(f"❌ Weaviate update error: {weaviate_error}")
-                    # Continue even if update fails - the data is still in Weaviate
-                
-                # Mark as completed ONLY after all operations are done
-                mongodb_manager.update_upload_progress(
-                    session_id, filename, "completed", 
-                    document_id=doc_id, chunks_count=chunks_count
-                )
-                
-                # Update document status to processed
-                mongodb_manager.update_document_status(doc_id, "processed")
-                
-                logger.info(f"✅ Successfully processed: {filename} ({chunks_count} chunks)")
-                
-            except Exception as file_error:
-                logger.error(f"❌ Error processing file {filename}: {file_error}")
-                mongodb_manager.update_upload_progress(
-                    session_id, filename, "failed", 
-                    error_message=str(file_error)
-                )
+        # Process files in batches for better performance
+        batch_size = 3  # Process max 3 files concurrently
         
-        logger.info(f"🎉 Document processing completed for session: {session_id}")
+        for i in range(0, len(uploaded_files), batch_size):
+            batch_files = uploaded_files[i:i+batch_size]
+            
+            # Process batch in parallel
+            tasks = []
+            for filename in batch_files:
+                task = process_single_file_optimized(
+                    session_id, temp_dir, filename, collection
+                )
+                tasks.append(task)
+            
+            # Wait for batch completion
+            await asyncio.gather(*tasks, return_exceptions=True)
+        
+        logger.info(f"🎉 Optimized document processing completed for session: {session_id}")
         
     except Exception as e:
-        logger.error(f"❌ Error in document processing session {session_id}: {e}")
+        logger.error(f"❌ Error in optimized document processing session {session_id}: {e}")
         # Mark any remaining pending files as failed
         session = mongodb_manager.get_upload_session(session_id)
         if session:
@@ -1066,8 +961,123 @@ async def process_uploaded_documents_with_progress(session_id: str, temp_dir: st
                     )
     finally:
         # Clean up temporary directory
+        if os.path.exists(temp_dir):
             shutil.rmtree(temp_dir, ignore_errors=True)
             logger.info(f"🧹 Cleaned up temporary directory: {temp_dir}")
+
+async def process_single_file_optimized(session_id: str, temp_dir: str, filename: str, collection):
+    """Process a single file with full optimization"""
+    global embedding_model, mongodb_manager
+    
+    try:
+        logger.info(f"🔄 Processing file: {filename}")
+        # Update status to processing
+        mongodb_manager.update_upload_progress(session_id, filename, "processing")
+        
+        file_path = os.path.join(temp_dir, filename)
+        
+        # Check if document already exists
+        existing_doc = mongodb_manager.get_document_by_filename(filename)
+        if existing_doc:
+            logger.info(f"📄 Document {filename} already exists, skipping...")
+            mongodb_manager.update_upload_progress(
+                session_id, filename, "completed", 
+                document_id=existing_doc["_id"]
+            )
+            return
+        
+        # Parallel operations: Read file + Process document
+        def read_file_content():
+            with open(file_path, 'rb') as f:
+                return f.read()
+        
+        def process_document():
+            return load_and_process_documents(temp_dir, specific_files=[filename])
+        
+        file_content, documents_data = await asyncio.gather(
+            asyncio.to_thread(read_file_content),
+            asyncio.to_thread(process_document)
+        )
+                
+        if not documents_data:
+            mongodb_manager.update_upload_progress(
+                session_id, filename, "failed", 
+                error_message="Failed to extract content from PDF"
+                    )
+            return
+        
+        logger.info(f"📄 Extracted {len(documents_data)} chunks from {filename}")
+        
+        # Parallel operations: Create embeddings + Store in MongoDB
+        def create_embeddings():
+            # Sync embedding creation - simple and reliable
+            embeddings = []
+            for doc in documents_data:
+                try:
+                    embedding = embedding_model.encode(doc['content'])
+                    embeddings.append(embedding.tolist())
+                except Exception as e:
+                    logger.warning(f"Failed to create embedding for chunk: {e}")
+                    # Fallback to zero vector
+                    embeddings.append([0.0] * 384)
+            return embeddings
+        
+        def store_in_mongodb():
+            return mongodb_manager.store_document(
+                file_name=filename,
+                file_content=file_content,
+                metadata={"processed_at": datetime.now().isoformat()},
+                status="processing"
+            )
+        
+        embeddings, doc_id = await asyncio.gather(
+            asyncio.to_thread(create_embeddings),
+            asyncio.to_thread(store_in_mongodb)
+        )
+                
+        # Store chunks in MongoDB
+        chunks_count = await asyncio.to_thread(
+            mongodb_manager.store_document_chunks, doc_id, documents_data
+        )
+        
+        # Add to Weaviate with final document_id
+        data_objects = []
+        
+        for i, (doc, embedding) in enumerate(zip(documents_data, embeddings)):
+            try:
+                doc_properties = dict(doc)
+                doc_properties["document_id"] = doc_id
+                doc_properties["chunk_index"] = i
+                
+                data_objects.append(DataObject(
+                    properties=doc_properties, 
+                    vector=embedding
+                ))
+            except Exception as e:
+                logger.warning(f"⚠️ Failed to prepare chunk {i} for {filename}: {e}")
+        
+        # Batch insert to Weaviate
+        if data_objects:
+            await asyncio.to_thread(collection.data.insert_many, data_objects)
+            logger.info(f"✅ Added {len(data_objects)} chunks to Weaviate for {filename}")
+        
+        # Mark as completed
+        mongodb_manager.update_upload_progress(
+            session_id, filename, "completed", 
+            document_id=doc_id, chunks_count=chunks_count
+        )
+        
+        # Update document status
+        mongodb_manager.update_document_status(doc_id, "processed")
+        
+        logger.info(f"✅ Successfully processed: {filename} ({chunks_count} chunks)")
+        
+    except Exception as file_error:
+        logger.error(f"❌ Error processing file {filename}: {file_error}")
+        mongodb_manager.update_upload_progress(
+            session_id, filename, "failed", 
+            error_message=str(file_error)
+        )
 
 # =================== SPEECH ENDPOINTS ===================
 
@@ -1292,6 +1302,38 @@ async def get_speech_voices():
         "voices": speech_processor.get_available_voices() if speech_processor else {},
         "default": "tr-TR-EmelNeural"
     }
+
+@app.post("/api/admin/clear-cache")
+async def clear_system_cache(token: AuthRequired):
+    """Clear all system caches for debugging"""
+    try:
+        # Import all cache objects
+        from query_processor import query_analysis_cache, query_variants_cache
+        from search_engine import search_cache
+        from embedding_engine import embedding_cache
+        from response_generator import response_cache
+        
+        # Clear all caches
+        query_analysis_cache.clear()
+        query_variants_cache.clear()
+        search_cache.clear()
+        embedding_cache.clear()
+        response_cache.clear()
+        
+        return {
+            "status": "success",
+            "message": "All system caches cleared successfully",
+            "cleared_caches": [
+                "query_analysis_cache",
+                "query_variants_cache", 
+                "search_cache",
+                "embedding_cache",
+                "response_cache"
+            ]
+        }
+    except Exception as e:
+        logger.error(f"Cache clear failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Cache clear failed: {e}")
 
 if __name__ == "__main__":
     print("🚀 Starting IntelliDocs API Backend v2.0...")
