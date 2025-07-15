@@ -337,7 +337,7 @@ class SearchEngine:
                     
                     # Apply biographical content boost
                     if self._contains_biographical_info(doc):
-                        score *= 1.4  # 40% boost for biographical content
+                        score *= 1.15  # 15% boost for biographical content
                         print(f"   📊 Applied biographical boost to semantic result (score: {score:.3f})")
                     
                     combined.append({
@@ -353,11 +353,11 @@ class SearchEngine:
             for i, doc in enumerate(keyword_results['documents'][0]):
                 doc_key = doc[:100]
                 if doc_key not in seen_docs and doc.strip():
-                    score = 0.6  # Fixed score for keyword matches
+                    score = len(common_words) / len(question_words) if len(question_words) > 0 else 0
                     
                     # Apply biographical content boost
                     if self._contains_biographical_info(doc):
-                        score *= 1.4  # 40% boost for biographical content
+                        score *= 1.15  # 15% boost for biographical content
                         print(f"   📊 Applied biographical boost to keyword result (score: {score:.3f})")
                     
                     combined.append({
@@ -378,7 +378,6 @@ class SearchEngine:
         
         # Biographical indicators
         biographical_indicators = [
-            'rektörüdür',           # "is the rector"
             'özgeçmiş',             # "biography"
             'doğdu',                # "was born"
             'atanan prof',          # "appointed professor"
@@ -505,7 +504,7 @@ class SearchEngine:
                     
                     # Apply biographical content boost
                     if self._contains_biographical_info(doc):
-                        score *= 1.4  # 40% boost for biographical content
+                        score *= 1.15  # 15% boost for biographical content
                         print(f"   📊 Applied biographical boost to semantic result (score: {score:.3f})")
                     
                     combined.append({

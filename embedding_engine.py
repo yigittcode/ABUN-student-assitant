@@ -4,9 +4,11 @@ Advanced semantic-aware embedding generation with content intelligence
 """
 
 import asyncio
+import google.generativeai as genai
 import numpy as np
 from typing import List, Dict, Optional
 from cachetools import TTLCache
+from config import EMBEDDING_DIMENSION
 import re
 
 # Embedding cache for performance
@@ -150,7 +152,7 @@ class SemanticEmbeddingEngine:
                 cache_hits += 1
             else:
                 # Generate embedding with enhancement
-                embedding = await asyncio.to_thread(self.embedding_model.encode, enhanced_query)
+                embedding = genai.embed_content(model=self.embedding_model, content=enhanced_query)['embedding']
                 embedding_array = np.array(embedding)
                 embedding_cache[cache_key] = embedding_array
                 embeddings.append(embedding_array)
@@ -177,7 +179,7 @@ class SemanticEmbeddingEngine:
         
         if not embeddings:
             print("❌ No embeddings generated, returning zero vector")
-            return np.zeros(self.embedding_model.get_sentence_embedding_dimension())
+            return np.zeros(EMBEDDING_DIMENSION)
         
         if len(embeddings) == 1:
             return embeddings[0]
@@ -256,12 +258,7 @@ class SemanticEmbeddingEngine:
         async def process_semantic_batch(batch: List[str], batch_idx: int) -> List[List[float]]:
             try:
                 batch_embeddings = await asyncio.to_thread(
-                    lambda: self.embedding_model.encode(
-                        batch, 
-                        batch_size=min(32, len(batch)), 
-                        show_progress_bar=False,
-                        normalize_embeddings=True  # Normalize for better semantic similarity
-                    )
+                    lambda: genai.embed_content(model=self.embedding_model, content=batch, task_type="retrieval_document")['embedding']
                 )
                 print(f"⚡ Completed semantic batch {batch_idx}")
                 return batch_embeddings.tolist()
@@ -271,11 +268,11 @@ class SemanticEmbeddingEngine:
                 fallback_embeddings = []
                 for enhanced_content in batch:
                     try:
-                        embedding = await asyncio.to_thread(self.embedding_model.encode, enhanced_content)
-                        fallback_embeddings.append(embedding.tolist())
+                        embedding = genai.embed_content(model=self.embedding_model, content=enhanced_content, task_type="retrieval_document")['embedding']
+                        fallback_embeddings.append(embedding)
                     except:
                         # Ultimate fallback: zero vector
-                        dim = self.embedding_model.get_sentence_embedding_dimension()
+                        dim = 768
                         fallback_embeddings.append([0.0] * dim)
                 return fallback_embeddings
         
@@ -327,9 +324,7 @@ class SemanticEmbeddingEngine:
         
         return similarities.tolist()
     
-    def get_embedding_dimension(self) -> int:
-        """Get the embedding dimension of the model"""
-        return self.embedding_model.get_sentence_embedding_dimension()
+    
 
 # Backward compatibility class
 class EmbeddingEngine(SemanticEmbeddingEngine):

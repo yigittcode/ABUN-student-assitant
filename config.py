@@ -7,6 +7,8 @@ load_dotenv()
 # API Keys and Authentication
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+
 # JWT Authentication Configuration
 JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY")
 JWT_ALGORITHM = "HS256"
@@ -32,7 +34,8 @@ COLLECTION_NAME = "IntelliDocs_Documents"
 PERSISTENT_COLLECTION_NAME = os.getenv("PERSISTENT_COLLECTION_NAME")
 
 # Model Configuration
-EMBEDDING_MODEL = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
+EMBEDDING_MODEL = "models/embedding-001"  # DEĞİŞTİ: Gemini embedding modelinin resmi adı.
+EMBEDDING_DIMENSION = 768 
 CROSS_ENCODER_MODEL = 'cross-encoder/ms-marco-MiniLM-L-12-v2'  # Better model for Turkish
 LLM_MODEL = "gpt-4o-mini"
 HYDE_LLM_MODEL = "gpt-4o-mini" 

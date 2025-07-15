@@ -12,7 +12,8 @@ from typing import List, Dict, Optional, Any, Annotated
 import weaviate
 from weaviate.classes.data import DataObject
 from openai import AsyncOpenAI
-from sentence_transformers import SentenceTransformer, CrossEncoder
+import google.generativeai as genai
+from sentence_transformers import CrossEncoder
 import uvicorn
 import logging
 from contextlib import asynccontextmanager
@@ -172,7 +173,8 @@ async def lifespan(app: FastAPI):
         
         # Load AI models
         logger.info(f"Loading Bi-Encoder model: {EMBEDDING_MODEL}")
-        embedding_model = SentenceTransformer(EMBEDDING_MODEL)
+        genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
+        embedding_model = EMBEDDING_MODEL
         
         logger.info(f"Loading Cross-Encoder model: {CROSS_ENCODER_MODEL}")
         cross_encoder_model = CrossEncoder(CROSS_ENCODER_MODEL)
@@ -199,6 +201,9 @@ async def lifespan(app: FastAPI):
         # Initialize Speech Processor
         logger.info("Initializing Speech Processor...")
         speech_processor = SpeechProcessor(whisper_model_name="small")
+        
+        # Initialize Transcript Advisor
+        await initialize_transcript_advisor()
         
         # Create upload directory for temporary files
         os.makedirs("./temp_uploads", exist_ok=True)
@@ -445,6 +450,7 @@ async def chat_with_documents_stream(message: ChatMessage):
         
         async def generate_stream():
             """Generate streaming response"""
+            import json
             try:
                 collected_response = ""
                 sources_metadata = []
@@ -680,7 +686,7 @@ async def get_document_details(document_id: str, token: AuthRequired):
             try:
                 from weaviate.classes.query import Filter
                 response_count = collection.aggregate.over_all(
-                    where=Filter.by_property("document_id").equal(document_id),
+                    filters=Filter.by_property("document_id").equal(document_id),
                     total_count=True
                 )
                 weaviate_chunks = response_count.total_count
@@ -968,60 +974,59 @@ async def process_uploaded_documents_with_progress(session_id: str, temp_dir: st
 async def process_single_file_optimized(session_id: str, temp_dir: str, filename: str, collection):
     """Process a single file with full optimization"""
     global embedding_model, mongodb_manager
-    
     try:
         logger.info(f"🔄 Processing file: {filename}")
         # Update status to processing
         mongodb_manager.update_upload_progress(session_id, filename, "processing")
-        
+
         file_path = os.path.join(temp_dir, filename)
-        
+
         # Check if document already exists
         existing_doc = mongodb_manager.get_document_by_filename(filename)
         if existing_doc:
             logger.info(f"📄 Document {filename} already exists, skipping...")
             mongodb_manager.update_upload_progress(
-                session_id, filename, "completed", 
+                session_id, filename, "completed",
                 document_id=existing_doc["_id"]
             )
             return
-        
+
         # Parallel operations: Read file + Process document
         def read_file_content():
             with open(file_path, 'rb') as f:
                 return f.read()
-        
+
         def process_document():
             return load_and_process_documents(temp_dir, specific_files=[filename])
-        
+
         file_content, documents_data = await asyncio.gather(
             asyncio.to_thread(read_file_content),
             asyncio.to_thread(process_document)
         )
-                
+
         if not documents_data:
             mongodb_manager.update_upload_progress(
-                session_id, filename, "failed", 
+                session_id, filename, "failed",
                 error_message="Failed to extract content from PDF"
-                    )
+            )
             return
-        
+
         logger.info(f"📄 Extracted {len(documents_data)} chunks from {filename}")
-        
+
         # Parallel operations: Create embeddings + Store in MongoDB
         def create_embeddings():
             # Sync embedding creation - simple and reliable
             embeddings = []
             for doc in documents_data:
                 try:
-                    embedding = embedding_model.encode(doc['content'])
-                    embeddings.append(embedding.tolist())
+                    embedding = genai.embed_content(model=EMBEDDING_MODEL, content=doc['content'])['embedding']
+                    embeddings.append(embedding)
                 except Exception as e:
                     logger.warning(f"Failed to create embedding for chunk: {e}")
                     # Fallback to zero vector
-                    embeddings.append([0.0] * 384)
+                    embeddings.append([0.0] * EMBEDDING_DIMENSION)
             return embeddings
-        
+
         def store_in_mongodb():
             return mongodb_manager.store_document(
                 file_name=filename,
@@ -1029,53 +1034,51 @@ async def process_single_file_optimized(session_id: str, temp_dir: str, filename
                 metadata={"processed_at": datetime.now().isoformat()},
                 status="processing"
             )
-        
+
         embeddings, doc_id = await asyncio.gather(
             asyncio.to_thread(create_embeddings),
             asyncio.to_thread(store_in_mongodb)
         )
-                
+
         # Store chunks in MongoDB
         chunks_count = await asyncio.to_thread(
             mongodb_manager.store_document_chunks, doc_id, documents_data
         )
-        
+
         # Add to Weaviate with final document_id
         data_objects = []
-        
         for i, (doc, embedding) in enumerate(zip(documents_data, embeddings)):
             try:
                 doc_properties = dict(doc)
                 doc_properties["document_id"] = doc_id
                 doc_properties["chunk_index"] = i
-                
                 data_objects.append(DataObject(
-                    properties=doc_properties, 
+                    properties=doc_properties,
                     vector=embedding
                 ))
             except Exception as e:
                 logger.warning(f"⚠️ Failed to prepare chunk {i} for {filename}: {e}")
-        
+
         # Batch insert to Weaviate
         if data_objects:
             await asyncio.to_thread(collection.data.insert_many, data_objects)
             logger.info(f"✅ Added {len(data_objects)} chunks to Weaviate for {filename}")
-        
+
         # Mark as completed
         mongodb_manager.update_upload_progress(
-            session_id, filename, "completed", 
+            session_id, filename, "completed",
             document_id=doc_id, chunks_count=chunks_count
         )
-        
+
         # Update document status
         mongodb_manager.update_document_status(doc_id, "processed")
-        
+
         logger.info(f"✅ Successfully processed: {filename} ({chunks_count} chunks)")
-        
+
     except Exception as file_error:
         logger.error(f"❌ Error processing file {filename}: {file_error}")
         mongodb_manager.update_upload_progress(
-            session_id, filename, "failed", 
+            session_id, filename, "failed",
             error_message=str(file_error)
         )
 
@@ -1334,6 +1337,120 @@ async def clear_system_cache(token: AuthRequired):
     except Exception as e:
         logger.error(f"Cache clear failed: {e}")
         raise HTTPException(status_code=500, detail=f"Cache clear failed: {e}")
+
+# =================== TRANSCRIPT ADVISOR ENDPOINTS ===================
+
+# Transcript Advisor global instance
+transcript_advisor = None
+
+async def initialize_transcript_advisor():
+    """Initialize transcript advisor on startup"""
+    global transcript_advisor, openai_client
+    try:
+        from transcript_advisor import IntelligentTranscriptAdvisor
+        transcript_advisor = IntelligentTranscriptAdvisor(openai_client)
+        logger.info("🎓 Transcript Advisor initialized successfully")
+    except Exception as e:
+        logger.error(f"❌ Failed to initialize Transcript Advisor: {e}")
+
+class TranscriptUploadRequest(BaseModel):
+    transcript_text: str
+
+class TranscriptAnalysisResponse(BaseModel):
+    status: str
+    message: str
+    analysis: Dict[str, Any]
+    recommendations: List[str]
+    next_steps: List[str]
+
+class AdvisorQuestionRequest(BaseModel):
+    question: str
+
+class AdvisorQuestionResponse(BaseModel):
+    status: str
+    message: str
+    response: str
+    analysis: Optional[Dict[str, Any]] = None
+    recommendations: Optional[List[str]] = None
+    next_steps: Optional[List[str]] = None
+    urgency_level: str = "normal"
+
+@app.post("/api/transcript/upload-pdf", response_model=TranscriptAnalysisResponse)
+async def upload_transcript_pdf(file: UploadFile = File(...)):
+    """Transcript PDF'ini yükle ve analiz et"""
+    global transcript_advisor
+    
+    try:
+        if not transcript_advisor:
+            raise HTTPException(status_code=503, detail="Transcript Advisor not initialized")
+        
+        # PDF dosyası kontrolü
+        if not file.filename.endswith('.pdf'):
+            raise HTTPException(status_code=400, detail="Sadece PDF dosyaları kabul edilir")
+        
+        # PDF'yi oku ve metne çevir
+        import pypdf
+        import tempfile
+        import os
+        
+        # Geçici dosya oluştur
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as temp_file:
+            content = await file.read()
+            temp_file.write(content)
+            temp_file_path = temp_file.name
+        
+        try:
+            # PDF'yi oku
+            reader = pypdf.PdfReader(temp_file_path)
+            full_text = ""
+            for page in reader.pages:
+                full_text += page.extract_text() + "\n"
+            
+            if not full_text.strip():
+                raise HTTPException(status_code=400, detail="PDF'den metin çıkarılamadı")
+            
+            # Transcript'i parse et
+            student_profile, courses = transcript_advisor.parse_transcript(full_text)
+            
+            # Kapsamlı analiz yap (async fonksiyon olduğu için await ile çağır)
+            analysis = await transcript_advisor.get_comprehensive_analysis()
+            
+            # Öneriler ve sonraki adımlar
+            recommendations = [
+                f"🎯 Akademik durumunuz: {student_profile.academic_standing}",
+                f"📊 Mevcut GPA: {student_profile.current_gpa:.2f}/4.0",
+                f"📚 Tamamlanan ders sayısı: {student_profile.completed_courses}",
+                f"💳 Toplam kredi: {student_profile.total_credits}",
+                f"🎓 ECTS: {student_profile.total_ects}",
+                f"📋 Hazırlık durumu: {student_profile.prep_status} ({student_profile.prep_grade} puan)"
+            ]
+            
+            next_steps = [
+                "📋 Detaylı analiz için soru sorabilirsiniz",
+                "🎓 Mezuniyet durumu hakkında bilgi alabilirsiniz", 
+                "📚 Ders önerileri için danışabilirsiniz",
+                "🚀 Kariyer planlaması yapabilirsiniz"
+            ]
+            
+            return TranscriptAnalysisResponse(
+                status="success",
+                message=f"✅ Transcript PDF başarıyla analiz edildi! {student_profile.name} için kapsamlı değerlendirme hazır.",
+                analysis=analysis,
+                recommendations=recommendations,
+                next_steps=next_steps
+            )
+            
+        finally:
+            # Geçici dosyayı sil
+            os.unlink(temp_file_path)
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ PDF transcript analysis error: {e}")
+        raise HTTPException(status_code=500, detail=f"PDF transcript analizi sırasında hata: {str(e)}")
+
+# =================== END TRANSCRIPT ADVISOR ENDPOINTS ===================
 
 if __name__ == "__main__":
     print("🚀 Starting IntelliDocs API Backend v2.0...")
