@@ -9,13 +9,16 @@ from typing import List, Dict, Any, Optional
 from cachetools import TTLCache
 
 # Search result cache
-search_cache = TTLCache(maxsize=1000, ttl=450)  # 7.5 min cache
+search_cache = TTLCache(maxsize=2000, ttl=300)  # 5 min cache for search results
 
 class SearchEngine:
     """Advanced search engine with hybrid search capabilities"""
     
     def __init__(self, cross_encoder_model=None):
         self.cross_encoder_model = cross_encoder_model
+        
+        # Add search result cache instance
+        self.search_result_cache = TTLCache(maxsize=1000, ttl=180)  # 3 min cache for complete search results
         
         # Domain-specific query expansion patterns for Turkish university content
         self.query_expansions = {
@@ -136,11 +139,32 @@ class SearchEngine:
     
     async def execute_multi_search(self, queries: List[str], query_vectors: List[np.ndarray], 
                                  collection, use_reranking: bool = True) -> List[Dict]:
-        """Execute multiple queries in parallel and combine results"""
+        """Execute multiple queries in parallel and combine results with result caching"""
+        
+        import time
+        start_time = time.time()
         
         print(f"🔍 Executing multi-search for {len(queries)} queries")
+        print(f"🗂️ Current cache size: {len(self.search_result_cache)}/{self.search_result_cache.maxsize}")
+        
+        # FIXED: More stable cache key generation
+        queries_sorted = sorted([q.lower().strip() for q in queries])  # Normalize queries
+        queries_hash = hash(tuple(queries_sorted))  # Use tuple for stable hashing
+        
+        # Simpler cache key without vector hashing for now
+        multi_search_cache_key = f"multi_search_{queries_hash}_{len(queries)}"
+        
+        # Check multi-search cache with better logging
+        if multi_search_cache_key in self.search_result_cache:
+            cache_time = time.time() - start_time
+            print(f"🚀 MULTI-SEARCH CACHE HIT! Saved ~8-12 seconds (lookup: {cache_time:.3f}s)")
+            return self.search_result_cache[multi_search_cache_key]
+        
+        print(f"💾 Cache miss - executing fresh multi-search (key: {multi_search_cache_key})")
+        print(f"🔍 Cache keys: {list(self.search_result_cache.keys())[:3]}...")  # Show first 3 keys for debugging
         
         # Execute all searches in parallel
+        search_start = time.time()
         search_tasks = []
         for i, query in enumerate(queries):
             query_vector = query_vectors[i] if i < len(query_vectors) else None
@@ -149,11 +173,22 @@ class SearchEngine:
         
         # Wait for all searches to complete
         all_results = await asyncio.gather(*search_tasks)
+        search_time = time.time() - search_start
+        
+        # CRITICAL FIX: Check if we actually got cached results (search_time near 0)
+        if search_time < 0.1:  # If search was super fast, it was likely cached at lower level
+            print(f"🚀 LOWER-LEVEL CACHE HIT! Individual searches cached (time: {search_time:.3f}s)")
+        else:
+            print(f"⏱️ Fresh search execution time: {search_time:.2f}s")
         
         # Combine and deduplicate results
+        combine_start = time.time()
         combined_results = self._combine_multi_search_results(all_results)
+        combine_time = time.time() - combine_start
+        print(f"⏱️ Result combination time: {combine_time:.3f}s")
         
         # Smart re-ranking: Only for complex queries or uncertain results
+        rerank_start = time.time()
         if use_reranking and self.cross_encoder_model and combined_results:
             primary_query = queries[0]  # Use first query as primary
             
@@ -164,12 +199,42 @@ class SearchEngine:
                     score_variance = max(top_scores) - min(top_scores)
                     if score_variance > 0.15:  # High confidence, skip re-ranking
                         print("🚀 Skipping re-ranking (high confidence results)")
-                        return combined_results[:15]
-            
-            reranked_results = await self._intelligent_rerank(primary_query, combined_results)
-            return reranked_results
+                        final_results = combined_results[:15]
+                    else:
+                        reranked_results = await self._intelligent_rerank(primary_query, combined_results)
+                        final_results = reranked_results
+                else:
+                    final_results = combined_results[:15]
+            else:
+                reranked_results = await self._intelligent_rerank(primary_query, combined_results)
+                final_results = reranked_results
+        else:
+            final_results = combined_results[:25]  # Return top 25 results for better coverage
         
-        return combined_results[:25]  # Return top 25 results for better coverage
+        rerank_time = time.time() - rerank_start
+        print(f"⏱️ Re-ranking time: {rerank_time:.3f}s")
+        
+        # Cache the complete result
+        try:
+            self.search_result_cache[multi_search_cache_key] = final_results
+            print(f"✅ Successfully cached {len(final_results)} results with key: {multi_search_cache_key}")
+            print(f"🗂️ Cache size after write: {len(self.search_result_cache)}/{self.search_result_cache.maxsize}")
+            print(f"⏰ Cache TTL: {self.search_result_cache.ttl} seconds")
+            
+            # Verify the write was successful
+            if multi_search_cache_key in self.search_result_cache:
+                print(f"✅ Cache write verification successful!")
+            else:
+                print(f"❌ Cache write verification FAILED!")
+                
+        except Exception as e:
+            print(f"❌ Cache write error: {e}")
+        
+        total_time = time.time() - start_time
+        print(f"💾 Cached multi-search results for future queries (total: {total_time:.3f}s)")
+        print(f"📊 Performance breakdown: Search={search_time:.3f}s, Combine={combine_time:.3f}s, Rerank={rerank_time:.3f}s")
+        
+        return final_results
     
     async def _perform_single_hybrid_search(self, question: str, query_vector: Optional[np.ndarray], 
                                           collection) -> List[Dict]:

@@ -1,7 +1,7 @@
 """
 🔧 Context Assembler Module
 Intelligent context assembly with multi-search fusion and balanced multi-topic handling
-WITH PARALLEL PROCESSING OPTIMIZATIONS
+WITH PARALLEL PROCESSING OPTIMIZATIONS AND CACHING
 """
 
 import re
@@ -10,10 +10,14 @@ from typing import List, Dict, Optional
 from dataclasses import dataclass
 from collections import defaultdict
 from config import MAX_CONTEXT_TOKENS
+from cachetools import TTLCache
 
 # Context management constants
 CHARS_PER_TOKEN = 3.5  # Conservative estimate for Turkish text
 MAX_CONTEXT_CHARS = int(MAX_CONTEXT_TOKENS * CHARS_PER_TOKEN * 0.9)  # 90% safety margin
+
+# Context assembly cache
+context_assembly_cache = TTLCache(maxsize=500, ttl=180)  # 3 min cache for assembled contexts
 
 @dataclass
 class ContextSegment:
@@ -45,11 +49,24 @@ class ContextAssembler:
     async def assemble_intelligent_context_async(self, search_results: List[Dict], original_query: str, 
                                                user_context: Optional[Dict] = None, 
                                                sub_questions: Optional[List[str]] = None) -> str:
-        """ASYNC version of intelligent context assembly with parallel processing"""
+        """ASYNC version of intelligent context assembly with parallel processing and caching"""
         
         if not search_results:
             print("⚠️ No search results available for context assembly")
             return "İlgili bilgi bulunamadı."
+        
+        # Create cache key for context assembly
+        search_results_hash = hash(str([r.get('document', '')[:50] for r in search_results[:10]]))
+        query_hash = hash(original_query.lower().strip())
+        sub_questions_hash = hash(str(sub_questions)) if sub_questions else 0
+        user_context_hash = hash(str(user_context)) if user_context else 0
+        
+        assembly_cache_key = f"context_{query_hash}_{search_results_hash}_{sub_questions_hash}_{user_context_hash}"
+        
+        # Check context assembly cache
+        if assembly_cache_key in context_assembly_cache:
+            print(f"🚀 Context assembly cache hit! Returning cached context for query")
+            return context_assembly_cache[assembly_cache_key]
         
         print(f"🔧 Assembling context from {len(search_results)} search results (ASYNC)")
         if sub_questions:
@@ -80,6 +97,10 @@ class ContextAssembler:
             )
         else:
             final_context = await asyncio.to_thread(self._assemble_final_context, personalized_segments, original_query)
+        
+        # Cache the assembled context
+        context_assembly_cache[assembly_cache_key] = final_context
+        print(f"💾 Cached context assembly for future queries")
         
         print(f"📊 Context assembly complete: {len(final_context)} chars, segments used for balanced representation")
         
@@ -293,18 +314,87 @@ class ContextAssembler:
             # Could add fallback logic here if needed
     
     def _group_segments_by_topic(self, segments: List[ContextSegment], sub_questions: List[str]) -> Dict[str, List]:
-        """Group segments by their strongest topic affinity"""
+        """Group segments by their strongest topic affinity with improved assignment logic"""
         
         topic_segments = defaultdict(list)
         
-        for segment in segments:
+        print(f"   🔍 Grouping {len(segments)} segments into {len(sub_questions)} topics")
+        print(f"   📋 Topics: {[q[:50] + '...' for q in sub_questions]}")
+        
+        # Analyze topics to identify burs-related ones
+        burs_topic_indices = []
+        for i, sub_q in enumerate(sub_questions):
+            if any(keyword in sub_q.lower() for keyword in ['burs', 'ösym', 'scholarship', 'başarı', 'şart', 'kriter']):
+                burs_topic_indices.append(i)
+                print(f"   💰 Topic {i} identified as burs-related: {sub_q[:40]}...")
+        
+        # First pass: Distribute burs.pdf segments strategically across ALL burs topics
+        burs_segments = [seg for seg in segments if 'burs.pdf' in seg.source.lower()]
+        other_segments = [seg for seg in segments if 'burs.pdf' not in seg.source.lower()]
+        
+        print(f"   📄 Found {len(burs_segments)} burs.pdf segments, {len(other_segments)} other segments")
+        
+        if len(burs_topic_indices) > 1 and burs_segments:
+            # CRITICAL FIX: Distribute burs segments across ALL burs topics
+            print(f"   🔄 SMART DISTRIBUTION: Spreading {len(burs_segments)} burs segments across {len(burs_topic_indices)} topics")
+            
+            # Sort burs segments by relevance to each topic
+            topic_segment_scores = defaultdict(list)
+            
+            for segment in burs_segments:
+                if segment.topic_relevance:
+                    for topic_idx in burs_topic_indices:
+                        topic_id = f"topic_{topic_idx}"
+                        if topic_id in segment.topic_relevance:
+                            score = segment.topic_relevance[topic_id]
+                            topic_segment_scores[topic_idx].append((segment, score))
+                        else:
+                            # Fallback scoring based on content keywords
+                            sub_q = sub_questions[topic_idx]
+                            fallback_score = self._calculate_fallback_topic_score(segment.content, sub_q)
+                            topic_segment_scores[topic_idx].append((segment, fallback_score))
+            
+            # Ensure each topic gets at least some segments
+            min_segments_per_topic = max(1, len(burs_segments) // len(burs_topic_indices))
+            
+            for topic_idx in burs_topic_indices:
+                topic_id = f"topic_{topic_idx}"
+                available_segments = topic_segment_scores[topic_idx]
+                
+                if available_segments:
+                    # Sort by score and take best ones
+                    available_segments.sort(key=lambda x: x[1], reverse=True)
+                    
+                    # Take at least min_segments_per_topic, but also consider score
+                    segments_to_assign = []
+                    
+                    # Always take top segments
+                    for seg, score in available_segments[:min_segments_per_topic]:
+                        segments_to_assign.append((seg, max(score, 0.6)))  # Boost score
+                    
+                    # Take additional high-scoring segments
+                    for seg, score in available_segments[min_segments_per_topic:]:
+                        if score > 0.3 and len(segments_to_assign) < 4:  # Max 4 per topic
+                            segments_to_assign.append((seg, score))
+                    
+                    topic_segments[topic_id].extend(segments_to_assign)
+                    print(f"   ✅ Topic {topic_idx}: Assigned {len(segments_to_assign)} burs segments")
+                    
+                    # Remove assigned segments from burs_segments to avoid double assignment
+                    assigned_segment_contents = {seg.content for seg, _ in segments_to_assign}
+                    burs_segments = [seg for seg in burs_segments if seg.content not in assigned_segment_contents]
+        
+        # Second pass: Handle remaining segments (including non-burs and remaining burs segments)
+        remaining_segments = other_segments + burs_segments
+        
+        for segment in remaining_segments:
             if not segment.topic_relevance:
                 continue
             
             # Find the topic this segment is most relevant to
             best_topic = max(segment.topic_relevance.items(), key=lambda x: x[1])
             
-            # CRITICAL FIX: Force assignment based on source file matching
+            # Force assignment for non-burs files
             force_assigned = False
             
             # Force yurt.pdf → yurt topic
@@ -316,24 +406,109 @@ class ContextAssembler:
                         print(f"   🔧 FORCE: yurt.pdf → topic {i}")
                         break
             
-            # Force burs.pdf → burs topic  
-            elif 'burs.pdf' in segment.source.lower():
-                for i, sub_q in enumerate(sub_questions):
-                    if 'burs' in sub_q.lower() or 'ösym' in sub_q.lower():
-                        topic_segments[f"topic_{i}"].append((segment, 1.0))
-                        force_assigned = True
-                        print(f"   🔧 FORCE: burs.pdf → topic {i}")
-                        break
-            
+            # Regular assignment based on relevance if not force-assigned
             if not force_assigned:
-                if best_topic[1] > 0.15:
+                if best_topic[1] > 0.15:  # Lowered threshold
                     topic_segments[best_topic[0]].append((segment, best_topic[1]))
                 else:
+                    # Even lower threshold for any relevance
                     any_relevance = any(score > 0.1 for score in segment.topic_relevance.values())
                     if any_relevance:
                         topic_segments[best_topic[0]].append((segment, best_topic[1]))
         
+        # Third pass: Ensure every topic has at least some segments with better fallback
+        for i, sub_question in enumerate(sub_questions):
+            topic_id = f"topic_{i}"
+            
+            if not topic_segments[topic_id]:
+                print(f"   ⚠️ Topic {i} has no segments, applying advanced rescue...")
+                
+                # Try multiple rescue strategies
+                rescued = False
+                
+                # Strategy 1: Find segments with ANY relevance to this topic
+                candidate_segments = []
+                for segment in segments:
+                    if segment.topic_relevance and topic_id in segment.topic_relevance:
+                        relevance_score = segment.topic_relevance[topic_id]
+                        if relevance_score > 0.05:  # Very low threshold
+                            candidate_segments.append((segment, relevance_score))
+                
+                if candidate_segments:
+                    candidate_segments.sort(key=lambda x: x[1], reverse=True)
+                    for segment, score in candidate_segments[:3]:
+                        topic_segments[topic_id].append((segment, score))
+                        print(f"   🔄 RESCUE: Added segment to topic {i} (score: {score:.2f})")
+                    rescued = True
+                
+                # Strategy 2: Keyword-based rescue with content analysis
+                if not rescued:
+                    topic_keywords = self._extract_topic_keywords(sub_question)
+                    
+                    # Look for segments that haven't been assigned elsewhere
+                    assigned_contents = set()
+                    for other_topic_segs in topic_segments.values():
+                        for seg, _ in other_topic_segs:
+                            assigned_contents.add(seg.content)
+                    
+                    for segment in segments:
+                        if segment.content in assigned_contents:
+                            continue  # Skip already assigned segments
+                            
+                        content_lower = segment.content.lower()
+                        keyword_matches = sum(1 for keyword in topic_keywords if keyword in content_lower)
+                        
+                        if keyword_matches > 0:
+                            relevance_score = keyword_matches * 0.15  # Better scoring
+                            topic_segments[topic_id].append((segment, relevance_score))
+                            print(f"   🆘 KEYWORD RESCUE: Added segment to topic {i} (keywords: {keyword_matches})")
+                            rescued = True
+                            break
+                
+                # Strategy 3: Force assign from burs segments if this is a burs topic
+                if not rescued and i in burs_topic_indices and burs_segments:
+                    # Take the first available burs segment
+                    fallback_segment = burs_segments[0]
+                    fallback_score = 0.4  # Moderate score
+                    topic_segments[topic_id].append((fallback_segment, fallback_score))
+                    print(f"   🆘 BURS FALLBACK: Force assigned burs segment to topic {i}")
+                    rescued = True
+        
+        # Topic distribution summary
+        for topic_id, segs in topic_segments.items():
+            topic_idx = int(topic_id.split('_')[1])
+            print(f"   📝 Topic {topic_idx} ({sub_questions[topic_idx][:40]}...): {len(segs)} segments")
+        
         return topic_segments
+    
+    def _calculate_fallback_topic_score(self, content: str, topic_query: str) -> float:
+        """Calculate a fallback relevance score based on keyword matching"""
+        
+        content_lower = content.lower()
+        topic_lower = topic_query.lower()
+        
+        # Extract key terms from topic query
+        topic_keywords = self._extract_topic_keywords(topic_query)
+        
+        # Count keyword matches
+        keyword_matches = sum(1 for keyword in topic_keywords if keyword in content_lower)
+        
+        # Additional scoring for specific patterns
+        score = keyword_matches * 0.1
+        
+        if 'başarı' in topic_lower:
+            if any(term in content_lower for term in ['başarı', 'not', 'ortalama', 'akademik']):
+                score += 0.2
+        
+        if 'şart' in topic_lower or 'kriter' in topic_lower:
+            if any(term in content_lower for term in ['şart', 'kriter', 'koşul', 'gereklidir', 'zorunlu']):
+                score += 0.2
+        
+        if 'burs' in topic_lower:
+            if any(term in content_lower for term in ['burs', 'muafiyet', 'ösym', 'indirim']):
+                score += 0.2
+        
+        return min(score, 1.0)  # Cap at 1.0
     
     # Keep all existing synchronous methods for backward compatibility
     def assemble_intelligent_context(self, search_results: List[Dict], original_query: str, 

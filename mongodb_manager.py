@@ -373,7 +373,8 @@ class MongoDBManager:
                         "source": 1,
                         "article": 1,
                         "chunk_index": 1,
-                        "metadata": 1
+                        "metadata": 1,
+                        "document_id": 1  # CRITICAL FIX: Include document_id in projection
                     }
                 )
                 .sort("chunk_index", 1)

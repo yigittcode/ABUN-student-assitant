@@ -52,6 +52,16 @@ class ResponseGenerator:
                     print("     ✅ Found [BURS BİLGİLERİ] section")
                 print(f"   🎯 Context preview: {context[:500]}...")
             
+            # CRITICAL DEBUG: Always log for problematic queries
+            if "dekan" in question.lower() or "tek ders" in question.lower():
+                print(f"🔍 DEBUG: Critical query analysis")
+                print(f"   📝 Question: {question}")
+                print(f"   📊 Context length: {len(context)} chars")
+                print(f"   🔍 Context contains 'dekan': {'dekan' in context.lower()}")
+                print(f"   🔍 Context contains 'tek ders': {'tek ders' in context.lower()}")
+                print(f"   🔍 Context contains 'sınav': {'sınav' in context.lower()}")
+                print(f"   🎯 Enhanced prompt preview: {enhanced_prompt[:800]}...")
+            
             response = await self.openai_client.chat.completions.create(
                 model=LLM_MODEL,
                 messages=[{"role": "user", "content": enhanced_prompt}],
