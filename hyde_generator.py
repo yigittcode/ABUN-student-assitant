@@ -1,6 +1,10 @@
 from config import HYDE_LLM_MODEL
 import asyncio
 import re
+from cachetools import TTLCache
+
+# HyDE cache for consistent generation
+hyde_cache = TTLCache(maxsize=500, ttl=1800)  # 30 min cache
 
 class AdvancedHydeGenerator:
     """Gelişmiş HyDE: Direkt referanslar + karmaşık senaryolar dahil"""
@@ -123,6 +127,13 @@ Answer with this approach:"""
 async def generate_enhanced_hyde(question, client, domain_context=""):
     """Gelişmiş HyDE: Direkt referanslar ve karmaşık senaryolar için optimize"""
     
+    # Check cache first
+    cache_key = f"hyde_{hash(question.lower().strip())}_{hash(domain_context)}"
+    if cache_key in hyde_cache:
+        cached_result = hyde_cache[cache_key]
+        print(f"🚀 Using cached HyDE for query")
+        return cached_result
+    
     # Kategori ve dil tespit et
     generator = AdvancedHydeGenerator()
     category = generator.detect_category(question)
@@ -171,13 +182,24 @@ async def generate_enhanced_hyde(question, client, domain_context=""):
         hyde_answer = response.choices[0].message.content.strip()
         print(f"✅ Generated enhanced HyDE: {hyde_answer[:80]}...")
         
-        return [hyde_answer]  # Liste olarak döndür compatibility için
+        result = [hyde_answer]  # Liste olarak döndür compatibility için
+        
+        # Cache the result
+        hyde_cache[cache_key] = result
+        print(f"💾 Cached HyDE for future queries")
+        
+        return result
     
     except Exception as e:
         print(f"❌ Enhanced HyDE generation error: {e}")
         # Fallback: Soruyu direkt kullan
         print("🔄 Using question as fallback HyDE")
-        return [question]
+        fallback_result = [question]
+        
+        # Cache fallback result too
+        hyde_cache[cache_key] = fallback_result
+        
+        return fallback_result
 
 
 # Main API function
