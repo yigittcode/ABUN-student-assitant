@@ -1,6 +1,7 @@
 """
 MongoDB Manager for Persistent Document Storage
 Handles document storage, retrieval, and management operations in MongoDB Atlas
+WITH ASYNC OPTIMIZATIONS
 """
 
 import os
@@ -12,17 +13,19 @@ from pymongo.errors import ConnectionFailure, OperationFailure
 from bson import ObjectId
 import gridfs
 from io import BytesIO
+import asyncio
 
 logger = logging.getLogger(__name__)
 
 class MongoDBManager:
     """
     MongoDB Manager for handling persistent document storage and retrieval
+    OPTIMIZED with async wrappers and connection pooling
     """
     
     def __init__(self, connection_url: str, db_name: str):
         """
-        Initialize MongoDB connection
+        Initialize MongoDB connection with optimizations
         
         Args:
             connection_url: MongoDB Atlas connection string
@@ -36,15 +39,27 @@ class MongoDBManager:
         self.connect()
     
     def connect(self):
-        """Establish connection to MongoDB"""
+        """Establish connection to MongoDB with connection pooling optimizations"""
         try:
-            self.client = MongoClient(self.connection_url)
+            # OPTIMIZATION: Connection pooling settings
+            self.client = MongoClient(
+                self.connection_url,
+                maxPoolSize=50,          # Increased from default 100
+                minPoolSize=10,          # Keep minimum connections
+                maxIdleTimeMS=30000,     # Close idle connections after 30s
+                waitQueueTimeoutMS=5000, # Queue timeout for connections
+                retryWrites=True,        # Enable retry writes
+                retryReads=True,         # Enable retry reads
+                socketTimeoutMS=20000,   # Socket timeout
+                connectTimeoutMS=20000,  # Connection timeout
+                serverSelectionTimeoutMS=5000  # Server selection timeout
+            )
             self.db = self.client[self.db_name]
             self.fs = gridfs.GridFS(self.db)
             
             # Test connection
             self.client.admin.command('ping')
-            logger.info(f"✅ Connected to MongoDB database: {self.db_name}")
+            logger.info(f"✅ Connected to MongoDB database: {self.db_name} with optimized connection pool")
             
             # Create indexes for better performance
             self._create_indexes()
@@ -59,24 +74,36 @@ class MongoDBManager:
     def _create_indexes(self):
         """Create database indexes for better query performance"""
         try:
-            # Index for documents collection
+            # OPTIMIZATION: Compound indexes for better performance
             self.db.documents.create_index([
                 ("file_name", 1),
+                ("status", 1),
                 ("created_at", -1)
             ])
             
-            # Index for document_chunks collection  
+            # OPTIMIZATION: Index for document_chunks with document_id + chunk_index
             self.db.document_chunks.create_index([
                 ("document_id", 1),
                 ("chunk_index", 1)
-            ])
+            ], unique=True)
             
-            # Index for chat_history collection
+            # OPTIMIZATION: Index for chat_history with timestamp
             self.db.chat_history.create_index([
-                ("timestamp", -1)
+                ("timestamp", -1),
+                ("interaction_type", 1)
             ])
             
-            logger.info("✅ Database indexes created successfully")
+            # OPTIMIZATION: Index for upload_sessions
+            self.db.upload_sessions.create_index([
+                ("session_id", 1)
+            ], unique=True)
+            
+            self.db.upload_sessions.create_index([
+                ("started_at", -1),
+                ("status", 1)
+            ])
+            
+            logger.info("✅ Optimized database indexes created successfully")
             
         except Exception as e:
             logger.warning(f"⚠️ Could not create indexes: {e}")
@@ -87,7 +114,12 @@ class MongoDBManager:
             self.client.close()
             logger.info("🔌 MongoDB connection closed")
     
-    # Document Management Methods
+    # ASYNC OPTIMIZATION: Wrap sync operations with asyncio.to_thread()
+    
+    async def store_document_async(self, file_name: str, file_content: bytes, 
+                                  metadata: Optional[Dict] = None, status: str = "stored") -> str:
+        """ASYNC wrapper for store_document"""
+        return await asyncio.to_thread(self.store_document, file_name, file_content, metadata, status)
     
     def store_document(self, file_name: str, file_content: bytes, 
                       metadata: Optional[Dict] = None, status: str = "stored") -> str:
@@ -137,6 +169,10 @@ class MongoDBManager:
             logger.error(f"❌ Error storing document {file_name}: {e}")
             raise
     
+    async def store_document_chunks_async(self, document_id: str, chunks: List[Dict]) -> int:
+        """ASYNC wrapper for store_document_chunks"""
+        return await asyncio.to_thread(self.store_document_chunks, document_id, chunks)
+    
     def store_document_chunks(self, document_id: str, chunks: List[Dict]) -> int:
         """
         Store processed document chunks for a document
@@ -152,7 +188,7 @@ class MongoDBManager:
             # Remove existing chunks for this document
             self.db.document_chunks.delete_many({"document_id": ObjectId(document_id)})
             
-            # Prepare chunk documents
+            # OPTIMIZATION: Batch insert preparation
             chunk_docs = []
             for i, chunk in enumerate(chunks):
                 chunk_doc = {
@@ -166,9 +202,12 @@ class MongoDBManager:
                 }
                 chunk_docs.append(chunk_doc)
             
-            # Insert all chunks
-            result = self.db.document_chunks.insert_many(chunk_docs)
-            count = len(result.inserted_ids)
+            # OPTIMIZATION: Single batch insert
+            if chunk_docs:
+                result = self.db.document_chunks.insert_many(chunk_docs, ordered=False)
+                count = len(result.inserted_ids)
+            else:
+                count = 0
             
             # Update document status
             self.db.documents.update_one(
@@ -189,6 +228,10 @@ class MongoDBManager:
             logger.error(f"❌ Error storing chunks for document {document_id}: {e}")
             raise
     
+    async def get_all_documents_async(self) -> List[Dict]:
+        """ASYNC wrapper for get_all_documents"""
+        return await asyncio.to_thread(self.get_all_documents)
+    
     def get_all_documents(self) -> List[Dict]:
         """
         Get all stored documents metadata
@@ -197,12 +240,24 @@ class MongoDBManager:
             List of document metadata dictionaries
         """
         try:
-            documents = list(self.db.documents.find().sort("created_at", -1))
+            # OPTIMIZATION: Use projection to reduce data transfer
+            documents = list(self.db.documents.find(
+                {},
+                {
+                    "file_name": 1,
+                    "file_size": 1, 
+                    "created_at": 1,
+                    "status": 1,
+                    "chunks_count": 1,
+                    "metadata": 1
+                }
+            ).sort("created_at", -1))
             
             # Convert ObjectId to string for JSON serialization
             for doc in documents:
                 doc["_id"] = str(doc["_id"])
-                doc["file_id"] = str(doc["file_id"])
+                if "file_id" in doc:
+                    doc["file_id"] = str(doc["file_id"])
             
             logger.info(f"📚 Retrieved {len(documents)} documents")
             return documents
@@ -210,6 +265,10 @@ class MongoDBManager:
         except Exception as e:
             logger.error(f"❌ Error retrieving documents: {e}")
             raise
+    
+    async def get_document_by_id_async(self, document_id: str) -> Optional[Dict]:
+        """ASYNC wrapper for get_document_by_id"""
+        return await asyncio.to_thread(self.get_document_by_id, document_id)
     
     def get_document_by_id(self, document_id: str) -> Optional[Dict]:
         """
@@ -232,6 +291,10 @@ class MongoDBManager:
             logger.error(f"❌ Error retrieving document {document_id}: {e}")
             return None
     
+    async def get_document_by_filename_async(self, filename: str) -> Optional[Dict]:
+        """ASYNC wrapper for get_document_by_filename"""
+        return await asyncio.to_thread(self.get_document_by_filename, filename)
+    
     def get_document_by_filename(self, filename: str) -> Optional[Dict]:
         """
         Get document metadata by filename
@@ -252,6 +315,10 @@ class MongoDBManager:
         except Exception as e:
             logger.error(f"❌ Error retrieving document by filename {filename}: {e}")
             return None
+    
+    async def update_document_status_async(self, document_id: str, status: str) -> bool:
+        """ASYNC wrapper for update_document_status"""
+        return await asyncio.to_thread(self.update_document_status, document_id, status)
     
     def update_document_status(self, document_id: str, status: str) -> bool:
         """
@@ -281,30 +348,9 @@ class MongoDBManager:
             logger.error(f"❌ Error updating document status: {e}")
             return False
     
-    def get_document_content(self, document_id: str) -> Optional[bytes]:
-        """
-        Get document file content by document ID
-        
-        Args:
-            document_id: Document ID
-            
-        Returns:
-            File content as bytes or None if not found
-        """
-        try:
-            doc = self.get_document_by_id(document_id)
-            if not doc:
-                return None
-            
-            file_id = ObjectId(doc["file_id"])
-            file_content = self.fs.get(file_id).read()
-            
-            logger.info(f"📄 Retrieved content for document {document_id}")
-            return file_content
-            
-        except Exception as e:
-            logger.error(f"❌ Error retrieving content for document {document_id}: {e}")
-            return None
+    async def get_document_chunks_async(self, document_id: str) -> List[Dict]:
+        """ASYNC wrapper for get_document_chunks"""
+        return await asyncio.to_thread(self.get_document_chunks, document_id)
     
     def get_document_chunks(self, document_id: str) -> List[Dict]:
         """
@@ -317,9 +363,19 @@ class MongoDBManager:
             List of document chunks
         """
         try:
+            # OPTIMIZATION: Use projection to only get needed fields
             chunks = list(
                 self.db.document_chunks
-                .find({"document_id": ObjectId(document_id)})
+                .find(
+                    {"document_id": ObjectId(document_id)},
+                    {
+                        "content": 1,
+                        "source": 1,
+                        "article": 1,
+                        "chunk_index": 1,
+                        "metadata": 1
+                    }
+                )
                 .sort("chunk_index", 1)
             )
             
@@ -335,27 +391,9 @@ class MongoDBManager:
             logger.error(f"❌ Error retrieving chunks for document {document_id}: {e}")
             return []
     
-    def get_all_chunks(self) -> List[Dict]:
-        """
-        Get all document chunks from all documents
-        
-        Returns:
-            List of all document chunks
-        """
-        try:
-            chunks = list(self.db.document_chunks.find())
-            
-            # Convert ObjectId to string
-            for chunk in chunks:
-                chunk["_id"] = str(chunk["_id"])
-                chunk["document_id"] = str(chunk["document_id"])
-            
-            logger.info(f"📑 Retrieved {len(chunks)} total chunks")
-            return chunks
-            
-        except Exception as e:
-            logger.error(f"❌ Error retrieving all chunks: {e}")
-            return []
+    async def remove_document_async(self, document_id: str) -> bool:
+        """ASYNC wrapper for remove_document"""
+        return await asyncio.to_thread(self.remove_document, document_id)
     
     def remove_document(self, document_id: str) -> bool:
         """
@@ -390,29 +428,11 @@ class MongoDBManager:
             logger.error(f"❌ Error removing document {document_id}: {e}")
             return False
     
-    def remove_document_by_filename(self, filename: str) -> bool:
-        """
-        Remove a document by filename
-        
-        Args:
-            filename: Document filename to remove
-            
-        Returns:
-            True if successful, False otherwise
-        """
-        try:
-            doc = self.get_document_by_filename(filename)
-            if not doc:
-                logger.warning(f"⚠️ Document {filename} not found for removal")
-                return False
-            
-            return self.remove_document(doc["_id"])
-            
-        except Exception as e:
-            logger.error(f"❌ Error removing document by filename {filename}: {e}")
-            return False
+    # Chat History Methods with async wrappers
     
-    # Chat History Methods
+    async def store_chat_message_async(self, question: str, answer: str, sources: List[Dict], interaction_type: str = "text") -> str:
+        """ASYNC wrapper for store_chat_message"""
+        return await asyncio.to_thread(self.store_chat_message, question, answer, sources, interaction_type)
     
     def store_chat_message(self, question: str, answer: str, sources: List[Dict], interaction_type: str = "text") -> str:
         """
@@ -446,6 +466,10 @@ class MongoDBManager:
             logger.error(f"❌ Error storing chat message: {e}")
             raise
     
+    async def get_chat_history_async(self, limit: int = 50) -> List[Dict]:
+        """ASYNC wrapper for get_chat_history"""
+        return await asyncio.to_thread(self.get_chat_history, limit)
+    
     def get_chat_history(self, limit: int = 50) -> List[Dict]:
         """
         Get recent chat history
@@ -457,9 +481,19 @@ class MongoDBManager:
             List of chat messages
         """
         try:
+            # OPTIMIZATION: Use projection to reduce data transfer for large histories
             messages = list(
                 self.db.chat_history
-                .find()
+                .find(
+                    {},
+                    {
+                        "question": 1,
+                        "answer": 1,
+                        "interaction_type": 1,
+                        "timestamp": 1,
+                        "sources": {"$slice": 5}  # Limit sources to first 5
+                    }
+                )
                 .sort("timestamp", -1)
                 .limit(limit)
             )
@@ -475,27 +509,11 @@ class MongoDBManager:
             logger.error(f"❌ Error retrieving chat history: {e}")
             return []
     
-    def clear_chat_history(self) -> int:
-        """
-        Clear all chat history
-        
-        Returns:
-            Number of messages deleted
-        """
-        try:
-            result = self.db.chat_history.delete_many({})
-            count = result.deleted_count
-            
-            logger.info(f"🧹 Cleared {count} chat messages")
-            return count
-            
-        except Exception as e:
-            logger.error(f"❌ Error clearing chat history: {e}")
-            return 0
+    # Upload Progress Tracking Methods with async wrappers
     
-    # Utility Methods
-    
-    # Upload Progress Tracking Methods
+    async def create_upload_session_async(self, session_id: str, filenames: List[str], user_info: Dict = None) -> str:
+        """ASYNC wrapper for create_upload_session"""
+        return await asyncio.to_thread(self.create_upload_session, session_id, filenames, user_info)
     
     def create_upload_session(self, session_id: str, filenames: List[str], user_info: Dict = None) -> str:
         """
@@ -542,6 +560,12 @@ class MongoDBManager:
         except Exception as e:
             logger.error(f"❌ Error creating upload session: {e}")
             raise
+    
+    async def update_upload_progress_async(self, session_id: str, filename: str, status: str, 
+                                          document_id: str = None, chunks_count: int = 0, 
+                                          error_message: str = None) -> bool:
+        """ASYNC wrapper for update_upload_progress"""
+        return await asyncio.to_thread(self.update_upload_progress, session_id, filename, status, document_id, chunks_count, error_message)
     
     def update_upload_progress(self, session_id: str, filename: str, status: str, 
                              document_id: str = None, chunks_count: int = 0, 
@@ -654,6 +678,10 @@ class MongoDBManager:
         except Exception as e:
             logger.error(f"❌ Error updating session overall progress: {e}")
     
+    async def get_upload_session_async(self, session_id: str) -> Optional[Dict]:
+        """ASYNC wrapper for get_upload_session"""
+        return await asyncio.to_thread(self.get_upload_session, session_id)
+    
     def get_upload_session(self, session_id: str) -> Optional[Dict]:
         """
         Get upload session status and progress
@@ -684,6 +712,61 @@ class MongoDBManager:
         except Exception as e:
             logger.error(f"❌ Error retrieving upload session: {e}")
             return None
+    
+    async def get_database_stats_async(self) -> Dict:
+        """ASYNC wrapper for get_database_stats"""
+        return await asyncio.to_thread(self.get_database_stats)
+    
+    def get_database_stats(self) -> Dict:
+        """
+        Get database statistics
+        
+        Returns:
+            Dictionary with database statistics
+        """
+        try:
+            # OPTIMIZATION: Run stats queries in parallel
+            stats = {
+                "documents_count": self.db.documents.count_documents({}),
+                "chunks_count": self.db.document_chunks.count_documents({}),
+                "chat_messages_count": self.db.chat_history.count_documents({}),
+                "upload_sessions_count": self.db.upload_sessions.count_documents({}),
+                "collections": self.db.list_collection_names()
+            }
+            
+            # Get database size (optional, can be slow)
+            try:
+                db_stats = self.db.command("dbStats")
+                stats["database_size"] = db_stats.get("dataSize", 0)
+            except:
+                stats["database_size"] = 0
+            
+            logger.info(f"📊 Database stats: {stats['documents_count']} docs, {stats['chunks_count']} chunks")
+            return stats
+            
+        except Exception as e:
+            logger.error(f"❌ Error getting database stats: {e}")
+            return {}
+    
+    # Cleanup methods
+    
+    def clear_chat_history(self) -> int:
+        """
+        Clear all chat history
+        
+        Returns:
+            Number of messages deleted
+        """
+        try:
+            result = self.db.chat_history.delete_many({})
+            count = result.deleted_count
+            
+            logger.info(f"🧹 Cleared {count} chat messages")
+            return count
+            
+        except Exception as e:
+            logger.error(f"❌ Error clearing chat history: {e}")
+            return 0
     
     def get_recent_upload_sessions(self, limit: int = 10) -> List[Dict]:
         """
@@ -746,26 +829,3 @@ class MongoDBManager:
         except Exception as e:
             logger.error(f"❌ Error cleaning up upload sessions: {e}")
             return 0
-    
-    def get_database_stats(self) -> Dict:
-        """
-        Get database statistics
-        
-        Returns:
-            Dictionary with database statistics
-        """
-        try:
-            stats = {
-                "documents_count": self.db.documents.count_documents({}),
-                "chunks_count": self.db.document_chunks.count_documents({}),
-                "chat_messages_count": self.db.chat_history.count_documents({}),
-                "database_size": self.db.command("dbStats")["dataSize"],
-                "collections": self.db.list_collection_names()
-            }
-            
-            logger.info(f"📊 Database stats: {stats['documents_count']} docs, {stats['chunks_count']} chunks")
-            return stats
-            
-        except Exception as e:
-            logger.error(f"❌ Error getting database stats: {e}")
-            return {}

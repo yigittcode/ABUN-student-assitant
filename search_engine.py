@@ -173,7 +173,7 @@ class SearchEngine:
     
     async def _perform_single_hybrid_search(self, question: str, query_vector: Optional[np.ndarray], 
                                           collection) -> List[Dict]:
-        """Perform enhanced hybrid search with parallel execution of all search types"""
+        """Perform enhanced hybrid search with query expansion for better coverage"""
         
         # Create cache key
         vector_hash = hash(tuple(query_vector.tolist())) if query_vector is not None else "no_vector"
@@ -190,7 +190,7 @@ class SearchEngine:
         
         db_type = self._detect_db_type(collection)
         
-        # Step 2: Execute ALL search operations in parallel
+        # Step 2: Execute semantic and keyword search in parallel for all expanded terms
         search_tasks = []
         
         # Original semantic search with query vector
@@ -200,32 +200,45 @@ class SearchEngine:
             else:
                 search_tasks.append(self._chroma_semantic_search(query_vector, collection))
         
-        # Parallel keyword searches for ALL expanded queries
-        for expanded_query in expanded_queries:
-            if db_type == 'weaviate':
-                search_tasks.append(self._weaviate_keyword_search(expanded_query, collection))
-            else:
-                search_tasks.append(self._keyword_search(expanded_query, collection))
+        # Keyword search for original query
+        if db_type == 'weaviate':
+            search_tasks.append(self._weaviate_keyword_search(question, collection))
+        else:
+            search_tasks.append(self._keyword_search(question, collection))
         
-        # Execute ALL searches in parallel - maximum concurrency
-        print(f"⚡ Executing {len(search_tasks)} search operations in parallel")
-        all_search_results = await asyncio.gather(*search_tasks, return_exceptions=True)
+        # Additional keyword searches for expanded terms (if any)
+        if len(expanded_queries) > 1:
+            print(f"   🔎 Performing {len(expanded_queries)-1} additional expansion searches")
+            for expanded_query in expanded_queries[1:]:  # Skip original query
+                if db_type == 'weaviate':
+                    search_tasks.append(self._weaviate_keyword_search(expanded_query, collection))
+                else:
+                    search_tasks.append(self._keyword_search(expanded_query, collection))
         
-        # Filter out failed searches and combine results
-        valid_results = []
-        for i, result in enumerate(all_search_results):
-            if isinstance(result, Exception):
-                print(f"⚠️ Search task {i} failed: {result}")
-            elif result:
-                valid_results.extend(result)
+        # Execute all searches in parallel
+        search_results = await asyncio.gather(*search_tasks)
         
-        # Step 3: Intelligent deduplication and scoring
-        combined_results = self._smart_deduplicate_and_score(valid_results, question)
+        # Step 3: Combine results from all searches
+        combined_semantic = search_results[0] if query_vector is not None else {'documents': [[]], 'metadatas': [[]], 'distances': [[]]}
+        
+        # Combine all keyword results
+        all_keyword_results = {'documents': [[]], 'metadatas': [[]]}
+        
+        start_idx = 1 if query_vector is not None else 0
+        for keyword_result in search_results[start_idx:]:
+            if keyword_result['documents'] and keyword_result['documents'][0]:
+                all_keyword_results['documents'][0].extend(keyword_result['documents'][0])
+                all_keyword_results['metadatas'][0].extend(keyword_result['metadatas'][0])
+        
+        # Step 4: Enhanced result combination with expansion boost
+        combined_results = self._combine_search_results_with_expansion(
+            combined_semantic, all_keyword_results, len(expanded_queries) - 1
+        )
         
         # Cache results
         search_cache[cache_key] = combined_results
         
-        print(f"✅ Combined {len(valid_results)} raw results into {len(combined_results)} unique results")
+        print(f"   ✅ Enhanced search completed: {len(combined_results)} results")
         return combined_results
     
     def _detect_db_type(self, collection):
@@ -538,42 +551,3 @@ class SearchEngine:
             print(f"   🎯 Applied expansion boost to {len([r for r in combined if 'expanded' in r['source']])} results")
         
         return combined 
-
-    def _smart_deduplicate_and_score(self, results: List[Dict], question: str) -> List[Dict]:
-        """Smart deduplication with relevance-based scoring"""
-        if not results:
-            return []
-        
-        # Group by content hash to identify duplicates
-        content_groups = {}
-        for result in results:
-            content = result.get('content', '').strip()
-            if not content:
-                continue
-                
-            # Create content hash for deduplication
-            content_hash = hash(content[:500])  # Use first 500 chars for grouping
-            
-            if content_hash not in content_groups:
-                content_groups[content_hash] = []
-            content_groups[content_hash].append(result)
-        
-        # Select best result from each group and boost scores
-        deduplicated = []
-        for content_hash, group in content_groups.items():
-            if len(group) == 1:
-                deduplicated.append(group[0])
-            else:
-                # Multiple results with same content - pick best score and boost it
-                best_result = max(group, key=lambda x: x.get('score', 0))
-                
-                # Boost score for multiple source confirmation
-                boost_factor = min(1.2, 1.0 + (len(group) - 1) * 0.05)
-                best_result['score'] = best_result.get('score', 0) * boost_factor
-                best_result['source_count'] = len(group)  # Track multiple sources
-                
-                deduplicated.append(best_result)
-        
-        # Sort by score and return top results
-        deduplicated.sort(key=lambda x: x.get('score', 0), reverse=True)
-        return deduplicated[:30]  # Increased result limit for better coverage 

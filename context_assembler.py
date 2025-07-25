@@ -1,9 +1,11 @@
 """
 🔧 Context Assembler Module
 Intelligent context assembly with multi-search fusion and balanced multi-topic handling
+WITH PARALLEL PROCESSING OPTIMIZATIONS
 """
 
 import re
+import asyncio
 from typing import List, Dict, Optional
 from dataclasses import dataclass
 from collections import defaultdict
@@ -28,7 +30,7 @@ class ContextSegment:
             self.topic_relevance = {}
 
 class ContextAssembler:
-    """Intelligent context assembly with multi-search fusion"""
+    """Intelligent context assembly with multi-search fusion and parallel processing"""
     
     def __init__(self):
         # Domain-specific weight adjustments
@@ -40,48 +42,323 @@ class ContextAssembler:
             'kayıt': 1.1   # Registration info is relevant
         }
     
-    def assemble_intelligent_context(self, search_results: List[Dict], original_query: str, 
-                                   user_context: Optional[Dict] = None, 
-                                   sub_questions: Optional[List[str]] = None) -> str:
-        """Assemble context from multi-search results with intelligent fusion and balanced multi-topic handling"""
+    async def assemble_intelligent_context_async(self, search_results: List[Dict], original_query: str, 
+                                               user_context: Optional[Dict] = None, 
+                                               sub_questions: Optional[List[str]] = None) -> str:
+        """ASYNC version of intelligent context assembly with parallel processing"""
         
         if not search_results:
             print("⚠️ No search results available for context assembly")
             return "İlgili bilgi bulunamadı."
         
-        print(f"🔧 Assembling context from {len(search_results)} search results")
+        print(f"🔧 Assembling context from {len(search_results)} search results (ASYNC)")
         if sub_questions:
             print(f"📝 Multi-topic mode: {len(sub_questions)} topics detected")
         
-        # Step 1: Convert to context segments
-        context_segments = self._create_context_segments(search_results)
+        # Step 1: Convert to context segments (can be parallel)
+        context_segments = await asyncio.to_thread(self._create_context_segments, search_results)
         
-        # Step 2: Apply relevance scoring (with topic-specific scoring if complex)
+        # Step 2: Apply relevance scoring in parallel
         if sub_questions and len(sub_questions) > 1:
-            scored_segments = self._score_multi_topic_relevance(context_segments, original_query, sub_questions)
+            scored_segments = await self._score_multi_topic_relevance_async(context_segments, original_query, sub_questions)
         else:
-            scored_segments = self._score_relevance(context_segments, original_query)
+            scored_segments = await asyncio.to_thread(self._score_relevance, context_segments, original_query)
         
-        # Step 3: Detect and handle contradictions
-        resolved_segments = self._resolve_contradictions(scored_segments, original_query)
+        # Step 3: Detect and handle contradictions (can be async)
+        resolved_segments = await asyncio.to_thread(self._resolve_contradictions, scored_segments, original_query)
         
-        # Step 4: Apply user context if available
+        # Step 4: Apply user context if available (can be async)
         if user_context:
-            personalized_segments = self._apply_user_context(resolved_segments, user_context, original_query)
+            personalized_segments = await asyncio.to_thread(self._apply_user_context, resolved_segments, user_context, original_query)
         else:
             personalized_segments = resolved_segments
         
         # Step 5: Assemble final context with balanced multi-topic handling
         if sub_questions and len(sub_questions) > 1:
-            final_context = self._assemble_balanced_multi_topic_context(
+            final_context = await self._assemble_balanced_multi_topic_context_async(
                 personalized_segments, original_query, sub_questions
             )
         else:
-            final_context = self._assemble_final_context(personalized_segments, original_query)
+            final_context = await asyncio.to_thread(self._assemble_final_context, personalized_segments, original_query)
         
         print(f"📊 Context assembly complete: {len(final_context)} chars, segments used for balanced representation")
         
         return final_context
+    
+    async def _score_multi_topic_relevance_async(self, segments: List[ContextSegment], 
+                                               original_query: str, sub_questions: List[str]) -> List[ContextSegment]:
+        """ASYNC version of multi-topic relevance scoring with parallel processing"""
+        
+        print(f"🎯 Multi-topic relevance scoring for {len(sub_questions)} topics (ASYNC)")
+        
+        # Parallel topic relevance calculation for each segment
+        async def calculate_segment_topic_relevance(segment: ContextSegment):
+            segment.topic_relevance = {}
+            
+            # Calculate relevance for each topic in parallel
+            topic_tasks = []
+            for i, sub_question in enumerate(sub_questions):
+                task = asyncio.to_thread(self._calculate_topic_relevance, segment.content, sub_question)
+                topic_tasks.append((f"topic_{i}", task))
+            
+            # Wait for all topic calculations
+            for topic_id, task in topic_tasks:
+                topic_score = await task
+                segment.topic_relevance[topic_id] = topic_score
+                
+                # Log high-relevance segments for debugging
+                if topic_score > 0.7:
+                    print(f"   🎯 High relevance for {topic_id}: {topic_score:.2f} - {segment.content[:80]}...")
+            
+            return segment
+        
+        # Process all segments in parallel
+        segment_tasks = [
+            calculate_segment_topic_relevance(segment) 
+            for segment in segments
+        ]
+        
+        # Wait for all segment processing to complete
+        updated_segments = await asyncio.gather(*segment_tasks)
+        
+        # Apply traditional relevance scoring as well
+        scored_segments = await asyncio.to_thread(self._score_relevance, updated_segments, original_query)
+        
+        return scored_segments
+    
+    async def _assemble_balanced_multi_topic_context_async(self, segments: List[ContextSegment], 
+                                                         original_query: str, sub_questions: List[str]) -> str:
+        """ASYNC version of balanced multi-topic context assembly with parallel processing"""
+        
+        print(f"⚖️ Assembling balanced context for {len(sub_questions)} topics (ASYNC)")
+        
+        # Group segments by their strongest topic affinity (can be async)
+        topic_segments = await asyncio.to_thread(self._group_segments_by_topic, segments, sub_questions)
+        
+        # Calculate adaptive token allocation
+        available_tokens = MAX_CONTEXT_TOKENS - 300  # Reserve for formatting
+        num_topics = len(sub_questions)
+        
+        # Adaptive allocation for better semantic coverage
+        if num_topics == 2:
+            base_tokens_per_topic = int(available_tokens * 0.44)
+        elif num_topics == 3:
+            base_tokens_per_topic = int(available_tokens * 0.30)
+        elif num_topics == 4:
+            base_tokens_per_topic = int(available_tokens * 0.23)
+        else:
+            base_tokens_per_topic = available_tokens // (num_topics + 1)
+        
+        print(f"   💰 Semantic-aware token allocation: {base_tokens_per_topic} per topic (total: {available_tokens})")
+        
+        # Process each topic in parallel
+        async def process_topic(topic_index: int, sub_question: str):
+            topic_id = f"topic_{topic_index}"
+            topic_segs = topic_segments.get(topic_id, [])
+            
+            if not topic_segs:
+                print(f"   ⚠️ No segments found for topic {topic_index}: {sub_question}")
+                return None
+            
+            # Sort by topic-specific relevance
+            topic_segs.sort(key=lambda x: x[1], reverse=True)
+            
+            # Build topic context (LLM-friendly format)
+            if 'yurt' in sub_question.lower():
+                topic_context = f"\n[YURT BİLGİLERİ]:\n"
+            elif 'burs' in sub_question.lower():
+                topic_context = f"\n[BURS BİLGİLERİ]:\n"
+            elif 'ders' in sub_question.lower():
+                topic_context = f"\n[DERS BİLGİLERİ]:\n"
+            else:
+                topic_word = sub_question.split()[0].upper() if sub_question else "BİLGİ"
+                topic_context = f"\n[{topic_word} HAKKINDA]:\n"
+            
+            topic_tokens = self._estimate_tokens_fast(topic_context)
+            
+            segments_added = 0
+            min_segments_per_topic = 2
+            max_segments_per_topic = 4
+            
+            for segment, topic_score in topic_segs:
+                segment_text = self._format_segment(segment)
+                segment_tokens = self._estimate_tokens_fast(segment_text)
+                
+                if segments_added >= max_segments_per_topic:
+                    break
+                
+                if topic_tokens + segment_tokens > base_tokens_per_topic:
+                    if segments_added < min_segments_per_topic:
+                        remaining_tokens = base_tokens_per_topic - topic_tokens
+                        if remaining_tokens > 200:
+                            truncated = self._smart_truncate_segment(segment, remaining_tokens)
+                            if truncated:
+                                topic_context += truncated
+                                segments_added += 1
+                                topic_tokens += self._estimate_tokens_fast(truncated)
+                    break
+                
+                topic_context += segment_text
+                topic_tokens += segment_tokens
+                segments_added += 1
+            
+            if segments_added > 0:
+                print(f"   ✅ Topic {topic_index}: {segments_added} segments, {topic_tokens} tokens")
+                return (topic_context, topic_tokens)
+            else:
+                print(f"   ⚠️ Topic {topic_index}: No segments fit in token limit")
+                return None
+        
+        # Process all topics in parallel
+        topic_tasks = [
+            process_topic(i, sub_question) 
+            for i, sub_question in enumerate(sub_questions)
+        ]
+        
+        topic_results = await asyncio.gather(*topic_tasks, return_exceptions=True)
+        
+        # Combine results
+        context_parts = []
+        used_tokens = 0
+        
+        for result in topic_results:
+            if result and not isinstance(result, Exception):
+                topic_context, topic_tokens = result
+                context_parts.append(topic_context)
+                used_tokens += topic_tokens
+        
+        # Add remaining high-quality unassigned segments if space allows
+        remaining_tokens = available_tokens - used_tokens
+        if remaining_tokens > 100:
+            unassigned_segments = [seg for seg in segments if not any(
+                seg in topic_segments[topic_id] for topic_id in topic_segments
+            )]
+            
+            if unassigned_segments:
+                print(f"   🔄 Adding general segments with {remaining_tokens} remaining tokens")
+                
+                unassigned_segments.sort(key=lambda x: x.relevance_score, reverse=True)
+                for segment in unassigned_segments:
+                    segment_text = self._format_segment(segment)
+                    segment_tokens = self._estimate_tokens_fast(segment_text)
+                    
+                    if segment_tokens > remaining_tokens:
+                        break
+                    
+                    context_parts.append(segment_text)
+                    remaining_tokens -= segment_tokens
+        
+        final_context = "\n".join(context_parts)
+        
+        # Enhanced validation: Check if each topic has meaningful representation
+        await self._validate_topic_representation_async(final_context, sub_questions, segments)
+        
+        return final_context
+    
+    async def _validate_topic_representation_async(self, final_context: str, sub_questions: List[str], segments: List[ContextSegment]):
+        """ASYNC validation of topic representation with fallback handling"""
+        
+        missing_topics = []
+        num_topics = len(sub_questions)
+        
+        # Parallel validation for each topic
+        async def validate_topic(i: int, sub_question: str):
+            topic_keywords = self._extract_topic_keywords(sub_question)
+            
+            # Check for keyword presence AND meaningful content length
+            has_keywords = any(keyword in final_context.lower() for keyword in topic_keywords)
+            
+            # Count content related to this topic
+            topic_content_chars = 0
+            for keyword in topic_keywords:
+                if keyword in final_context.lower():
+                    topic_content_chars += len(keyword) * 10
+            
+            content_threshold = 300 if num_topics <= 2 else 200
+            if not has_keywords or topic_content_chars < content_threshold:
+                print(f"   ⚠️ Topic {i} underrepresented: keywords={has_keywords}, content_chars={topic_content_chars}, threshold={content_threshold}")
+                return i
+            return None
+        
+        validation_tasks = [
+            validate_topic(i, sub_question) 
+            for i, sub_question in enumerate(sub_questions)
+        ]
+        
+        validation_results = await asyncio.gather(*validation_tasks)
+        missing_topics = [result for result in validation_results if result is not None]
+        
+        if missing_topics:
+            print(f"   🚨 Missing/underrepresented topics: {missing_topics}")
+            # Could add fallback logic here if needed
+    
+    def _group_segments_by_topic(self, segments: List[ContextSegment], sub_questions: List[str]) -> Dict[str, List]:
+        """Group segments by their strongest topic affinity"""
+        
+        topic_segments = defaultdict(list)
+        
+        for segment in segments:
+            if not segment.topic_relevance:
+                continue
+            
+            # Find the topic this segment is most relevant to
+            best_topic = max(segment.topic_relevance.items(), key=lambda x: x[1])
+            
+            # CRITICAL FIX: Force assignment based on source file matching
+            force_assigned = False
+            
+            # Force yurt.pdf → yurt topic
+            if 'yurt.pdf' in segment.source.lower():
+                for i, sub_q in enumerate(sub_questions):
+                    if 'yurt' in sub_q.lower():
+                        topic_segments[f"topic_{i}"].append((segment, 1.0))
+                        force_assigned = True
+                        print(f"   🔧 FORCE: yurt.pdf → topic {i}")
+                        break
+            
+            # Force burs.pdf → burs topic  
+            elif 'burs.pdf' in segment.source.lower():
+                for i, sub_q in enumerate(sub_questions):
+                    if 'burs' in sub_q.lower() or 'ösym' in sub_q.lower():
+                        topic_segments[f"topic_{i}"].append((segment, 1.0))
+                        force_assigned = True
+                        print(f"   🔧 FORCE: burs.pdf → topic {i}")
+                        break
+            
+            if not force_assigned:
+                if best_topic[1] > 0.15:
+                    topic_segments[best_topic[0]].append((segment, best_topic[1]))
+                else:
+                    any_relevance = any(score > 0.1 for score in segment.topic_relevance.values())
+                    if any_relevance:
+                        topic_segments[best_topic[0]].append((segment, best_topic[1]))
+        
+        return topic_segments
+    
+    # Keep all existing synchronous methods for backward compatibility
+    def assemble_intelligent_context(self, search_results: List[Dict], original_query: str, 
+                                   user_context: Optional[Dict] = None, 
+                                   sub_questions: Optional[List[str]] = None) -> str:
+        """Synchronous version - delegates to async version"""
+        import asyncio
+        
+        try:
+            # If we're already in an async context, use the async version
+            loop = asyncio.get_running_loop()
+            # Create a new task in the current loop
+            task = asyncio.create_task(
+                self.assemble_intelligent_context_async(search_results, original_query, user_context, sub_questions)
+            )
+            # Note: This is a simplified approach. In production, you might want to handle this differently
+            return asyncio.run_coroutine_threadsafe(
+                self.assemble_intelligent_context_async(search_results, original_query, user_context, sub_questions),
+                loop
+            ).result()
+        except RuntimeError:
+            # No event loop running, can use asyncio.run
+            return asyncio.run(
+                self.assemble_intelligent_context_async(search_results, original_query, user_context, sub_questions)
+            )
     
     def _create_context_segments(self, search_results: List[Dict]) -> List[ContextSegment]:
         """Convert search results to context segments"""
@@ -143,29 +420,6 @@ class ContextAssembler:
         segments.sort(key=lambda x: x.relevance_score, reverse=True)
         
         return segments
-    
-    def _score_multi_topic_relevance(self, segments: List[ContextSegment], 
-                                   original_query: str, sub_questions: List[str]) -> List[ContextSegment]:
-        """Score segments for multiple topics to ensure balanced representation"""
-        
-        print(f"🎯 Multi-topic relevance scoring for {len(sub_questions)} topics")
-        
-        # First, score each segment for each topic
-        for segment in segments:
-            segment.topic_relevance = {}
-            
-            for i, sub_question in enumerate(sub_questions):
-                topic_score = self._calculate_topic_relevance(segment.content, sub_question)
-                segment.topic_relevance[f"topic_{i}"] = topic_score
-                
-                # Log high-relevance segments for debugging
-                if topic_score > 0.7:
-                    print(f"   🎯 High relevance for topic {i}: {topic_score:.2f} - {segment.content[:80]}...")
-        
-        # Apply traditional relevance scoring as well
-        scored_segments = self._score_relevance(segments, original_query)
-        
-        return scored_segments
     
     def _calculate_topic_relevance(self, content: str, topic_query: str) -> float:
         """Enhanced topic relevance calculation with semantic matching"""
@@ -409,215 +663,6 @@ class ContextAssembler:
         else:
             print(f"   ❌ Emergency recovery failed")
             return "Bu konuda verilen dokümanlarda ilgili bilgiler mevcut ancak sistem yanıt oluştururken teknik bir sorunla karşılaştı. Lütfen sorunuzu farklı şekilde ifade ederek tekrar deneyin."
-    
-    def _assemble_balanced_multi_topic_context(self, segments: List[ContextSegment], 
-                                             original_query: str, sub_questions: List[str]) -> str:
-        """Assemble context ensuring balanced representation for all topics"""
-        
-        print(f"⚖️ Assembling balanced context for {len(sub_questions)} topics")
-        
-        # Group segments by their strongest topic affinity
-        topic_segments = defaultdict(list)
-        unassigned_segments = []
-        
-        for segment in segments:
-            if not segment.topic_relevance:
-                unassigned_segments.append(segment)
-                continue
-            
-            # Find the topic this segment is most relevant to
-            best_topic = max(segment.topic_relevance.items(), key=lambda x: x[1])
-            
-            # CRITICAL FIX: Force assignment based on source file matching
-            force_assigned = False
-            
-            # Force yurt.pdf → yurt topic
-            if 'yurt.pdf' in segment.source.lower():
-                for i, sub_q in enumerate(sub_questions):
-                    if 'yurt' in sub_q.lower():
-                        topic_segments[f"topic_{i}"].append((segment, 1.0))  # Force high score
-                        force_assigned = True
-                        print(f"   🔧 FORCE: yurt.pdf → topic {i}")
-                        break
-            
-            # Force burs.pdf → burs topic  
-            elif 'burs.pdf' in segment.source.lower():
-                for i, sub_q in enumerate(sub_questions):
-                    if 'burs' in sub_q.lower() or 'ösym' in sub_q.lower():
-                        topic_segments[f"topic_{i}"].append((segment, 1.0))  # Force high score
-                        force_assigned = True
-                        print(f"   🔧 FORCE: burs.pdf → topic {i}")
-                        break
-            
-            if not force_assigned:
-                if best_topic[1] > 0.15:  # Lowered threshold for more inclusive assignment
-                    topic_segments[best_topic[0]].append((segment, best_topic[1]))
-                else:
-                    # Still check if segment has ANY relevance to any topic
-                    any_relevance = any(score > 0.1 for score in segment.topic_relevance.values())
-                    if any_relevance:
-                        # Assign to best topic even with low score
-                        topic_segments[best_topic[0]].append((segment, best_topic[1]))
-                    else:
-                        unassigned_segments.append(segment)
-        
-        # Topic distribution summary
-        for topic_id, segs in topic_segments.items():
-            topic_idx = int(topic_id.split('_')[1])
-            print(f"   📝 Topic {topic_idx} ({sub_questions[topic_idx][:30]}...): {len(segs)} segments")
-        
-        # Calculate adaptive token allocation based on semantic chunking
-        available_tokens = MAX_CONTEXT_TOKENS - 300  # Reserve for formatting
-        num_topics = len(sub_questions)
-        
-        # Adaptive allocation for better semantic coverage
-        if num_topics == 2:
-            # 88% for topics (44% each), 12% for unassigned
-            base_tokens_per_topic = int(available_tokens * 0.44)
-        elif num_topics == 3:
-            # 90% for topics (30% each), 10% for unassigned  
-            base_tokens_per_topic = int(available_tokens * 0.30)
-        elif num_topics == 4:
-            # 92% for topics (23% each), 8% for unassigned
-            base_tokens_per_topic = int(available_tokens * 0.23)
-        else:
-            # Fallback for unusual topic counts
-            base_tokens_per_topic = available_tokens // (num_topics + 1)
-        
-        print(f"   💰 Semantic-aware token allocation: {base_tokens_per_topic} per topic (total: {available_tokens})")
-        
-        context_parts = []
-        used_tokens = 0
-        
-        # Allocate tokens for each topic
-        for i, sub_question in enumerate(sub_questions):
-            topic_id = f"topic_{i}"
-            topic_segs = topic_segments.get(topic_id, [])
-            
-            if not topic_segs:
-                print(f"   ⚠️ No segments found for topic {i}: {sub_question}")
-                continue
-            
-            # Sort by topic-specific relevance
-            topic_segs.sort(key=lambda x: x[1], reverse=True)
-            
-            # Add best segments for this topic (LLM-friendly format)
-            if 'yurt' in sub_question.lower():
-                topic_context = f"\n[YURT BİLGİLERİ]:\n"
-            elif 'burs' in sub_question.lower():
-                topic_context = f"\n[BURS BİLGİLERİ]:\n"
-            elif 'ders' in sub_question.lower():
-                topic_context = f"\n[DERS BİLGİLERİ]:\n"
-            else:
-                # Generic topic header
-                topic_word = sub_question.split()[0].upper() if sub_question else "BİLGİ"
-                topic_context = f"\n[{topic_word} HAKKINDA]:\n"
-            topic_tokens = self._estimate_tokens_fast(topic_context)
-            
-            segments_added = 0
-            min_segments_per_topic = 2  # MINIMUM 2 segments per topic
-            max_segments_per_topic = 4  # MAXIMUM 4 segments to avoid overwhelming
-            
-            for segment, topic_score in topic_segs:
-                segment_text = self._format_segment(segment)
-                segment_tokens = self._estimate_tokens_fast(segment_text)
-                
-                # Check if we've reached our maximums
-                if segments_added >= max_segments_per_topic:
-                    break
-                
-                # More generous fitting logic
-                if topic_tokens + segment_tokens > base_tokens_per_topic:
-                    # If we haven't reached minimum, try truncation
-                    if segments_added < min_segments_per_topic:
-                        remaining_tokens = base_tokens_per_topic - topic_tokens
-                        if remaining_tokens > 200:  # Only truncate if meaningful space left
-                            truncated = self._smart_truncate_segment(segment, remaining_tokens)
-                            if truncated:
-                                topic_context += truncated
-                                segments_added += 1
-                                topic_tokens += self._estimate_tokens_fast(truncated)
-                    break
-                
-                topic_context += segment_text
-                topic_tokens += segment_tokens
-                segments_added += 1
-            
-            if segments_added > 0:
-                context_parts.append(topic_context)
-                used_tokens += topic_tokens
-                print(f"   ✅ Topic {i}: {segments_added} segments, {topic_tokens} tokens")
-            else:
-                print(f"   ⚠️ Topic {i}: No segments fit in token limit")
-        
-        # Add remaining high-quality unassigned segments if space allows
-        remaining_tokens = available_tokens - used_tokens
-        if remaining_tokens > 100 and unassigned_segments:
-            print(f"   🔄 Adding general segments with {remaining_tokens} remaining tokens")
-            
-            unassigned_segments.sort(key=lambda x: x.relevance_score, reverse=True)
-            for segment in unassigned_segments:
-                segment_text = self._format_segment(segment)
-                segment_tokens = self._estimate_tokens_fast(segment_text)
-                
-                if segment_tokens > remaining_tokens:
-                    break
-                
-                context_parts.append(segment_text)
-                remaining_tokens -= segment_tokens
-        
-        final_context = "\n".join(context_parts)
-        
-        # Enhanced validation: Check if each topic has meaningful representation
-        missing_topics = []
-        for i, sub_question in enumerate(sub_questions):
-            topic_keywords = self._extract_topic_keywords(sub_question)
-            
-            # Check for keyword presence AND meaningful content length
-            has_keywords = any(keyword in final_context.lower() for keyword in topic_keywords)
-            
-            # Count content related to this topic
-            topic_content_chars = 0
-            for keyword in topic_keywords:
-                if keyword in final_context.lower():
-                    # Count surrounding context (simple heuristic)
-                    topic_content_chars += len(keyword) * 10  # Rough estimate
-            
-            # More generous validation for multi-topic - focus on meaningful content
-            content_threshold = 300 if num_topics <= 2 else 200  # More generous for 2-topic queries
-            if not has_keywords or topic_content_chars < content_threshold:
-                missing_topics.append(i)
-                print(f"   ⚠️ Topic {i} underrepresented: keywords={has_keywords}, content_chars={topic_content_chars}, threshold={content_threshold}")
-        
-        if missing_topics:
-            print(f"   🚨 Missing/underrepresented topics: {missing_topics}")
-            
-            # FINAL SOLUTION: Smart fallback to simple query logic for missing topics
-            for missing_idx in missing_topics:
-                missing_topic = sub_questions[missing_idx]
-                
-                # Try simple query approach for this specific topic
-                print(f"   🔄 Trying simple query approach for topic: {missing_topic}")
-                simple_context = self._emergency_simple_query_context(segments, missing_topic)
-                
-                if simple_context and len(simple_context.strip()) > 100:
-                    # If simple approach found good content, use it (LLM-friendly format)
-                    if 'yurt' in missing_topic.lower():
-                        topic_header = f"\n[YURT BİLGİLERİ EK]:\n"
-                    elif 'burs' in missing_topic.lower():
-                        topic_header = f"\n[BURS BİLGİLERİ EK]:\n"
-                    elif 'ders' in missing_topic.lower():
-                        topic_header = f"\n[DERS BİLGİLERİ EK]:\n"
-                    else:
-                        topic_word = missing_topic.split()[0].upper() if missing_topic else "BİLGİ"
-                        topic_header = f"\n[{topic_word} EK BİLGİ]:\n"
-                    
-                    final_context += topic_header + simple_context
-                    print(f"   ✅ Simple query fallback successful for topic {missing_idx}")
-                else:
-                    print(f"   ❌ Simple query fallback failed for topic {missing_idx}")
-        
-        return final_context
     
     def _extract_topic_keywords(self, topic_query: str) -> List[str]:
         """Extract key identifying words from a topic query"""

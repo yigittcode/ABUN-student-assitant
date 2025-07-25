@@ -1,6 +1,7 @@
 """🎤 Speech Integration Module
 RAG API'ye entegre edilebilir Speech-to-Speech modülü
 Whisper STT + Edge TTS
+WITH ASYNC OPTIMIZATIONS
 """
 
 import asyncio
@@ -15,7 +16,7 @@ from pathlib import Path
 import torch
 
 class SpeechProcessor:
-    """Ses işleme sınıfı - STT ve TTS"""
+    """Ses işleme sınıfı - STT ve TTS WITH ASYNC OPTIMIZATIONS"""
     
     def __init__(self, whisper_model_name: str = "small"):
         print("🎤 Speech Processor başlatılıyor...")
@@ -50,9 +51,9 @@ class SpeechProcessor:
             'yapılır': 'yapılmaktadır'
         }
     
-    def speech_to_text(self, audio_file_path: str, language: str = "tr") -> str:
+    async def speech_to_text_async(self, audio_file_path: str, language: str = "tr") -> str:
         """
-        Ses dosyasını metne çevir
+        ASYNC Ses dosyasını metne çevir
         
         Args:
             audio_file_path: Ses dosyası yolu
@@ -62,14 +63,35 @@ class SpeechProcessor:
             Tanınan metin
         """
         try:
-            # NOT: STT işlemi cancellable değil, ama hızlı olması gerekiyor
-            result = self.whisper_model.transcribe(audio_file_path, language=language)
-            text = result["text"].strip()
+            # STT işlemi CPU-intensive, thread'de çalıştır
+            def transcribe_audio():
+                result = self.whisper_model.transcribe(audio_file_path, language=language)
+                return result["text"].strip()
+            
+            # Whisper işlemini thread'de çalıştır
+            text = await asyncio.to_thread(transcribe_audio)
             print(f"🎤 STT Sonuç: '{text}'")
             return text
+            
         except Exception as e:
             print(f"❌ STT Hatası: {e}")
             return ""
+    
+    def speech_to_text(self, audio_file_path: str, language: str = "tr") -> str:
+        """
+        Sync wrapper for speech_to_text_async
+        """
+        try:
+            # Try to get existing event loop
+            loop = asyncio.get_running_loop()
+            # If we're in an async context, create a task
+            return asyncio.run_coroutine_threadsafe(
+                self.speech_to_text_async(audio_file_path, language),
+                loop
+            ).result()
+        except RuntimeError:
+            # No event loop running, can use asyncio.run
+            return asyncio.run(self.speech_to_text_async(audio_file_path, language))
     
     def optimize_text_for_tts(self, text: str) -> str:
         """
@@ -104,7 +126,7 @@ class SpeechProcessor:
     
     async def text_to_speech(self, text: str, voice: str = "tr-TR-EmelNeural") -> str:
         """
-        Metni sese çevir
+        ASYNC Metni sese çevir
         
         Args:
             text: Seslendirilecek metin
@@ -122,7 +144,7 @@ class SpeechProcessor:
                 temp_path = tmp_file.name
                 self.temp_files.append(temp_path)
             
-            # Edge TTS ile ses oluştur
+            # Edge TTS ile ses oluştur (zaten async)
             communicate = edge_tts.Communicate(optimized_text, voice)
             await communicate.save(temp_path)
             
@@ -133,10 +155,10 @@ class SpeechProcessor:
             print(f"❌ TTS Hatası: {e}")
             return ""
     
-    async def speech_to_speech(self, audio_file_path: str, rag_response: str, 
-                             voice: str = "tr-TR-EmelNeural", language: str = "tr") -> Dict[str, Any]:
+    async def speech_to_speech_async(self, audio_file_path: str, rag_response: str, 
+                                   voice: str = "tr-TR-EmelNeural", language: str = "tr") -> Dict[str, Any]:
         """
-        Tam Speech-to-Speech işlemi
+        ASYNC Tam Speech-to-Speech işlemi
         
         Args:
             audio_file_path: Giriş ses dosyası
@@ -148,8 +170,8 @@ class SpeechProcessor:
             İşlem sonucu
         """
         try:
-            # 1. STT: Ses → Metin
-            recognized_text = self.speech_to_text(audio_file_path, language)
+            # 1. STT: Ses → Metin (ASYNC)
+            recognized_text = await self.speech_to_text_async(audio_file_path, language)
             
             if not recognized_text:
                 return {
@@ -159,7 +181,7 @@ class SpeechProcessor:
                     "audio_path": ""
                 }
             
-            # 2. TTS: RAG Cevabı → Ses
+            # 2. TTS: RAG Cevabı → Ses (ASYNC)
             audio_path = await self.text_to_speech(rag_response, voice)
             
             if not audio_path:
@@ -185,6 +207,25 @@ class SpeechProcessor:
                 "recognized_text": "",
                 "audio_path": ""
             }
+    
+    async def speech_to_speech(self, audio_file_path: str, rag_response: str, 
+                             voice: str = "tr-TR-EmelNeural", language: str = "tr") -> Dict[str, Any]:
+        """
+        Sync wrapper for speech_to_speech_async
+        """
+        try:
+            # Try to get existing event loop
+            loop = asyncio.get_running_loop()
+            # If we're in an async context, create a task
+            return await asyncio.run_coroutine_threadsafe(
+                self.speech_to_speech_async(audio_file_path, rag_response, voice, language),
+                loop
+            )
+        except RuntimeError:
+            # No event loop running, can use asyncio.run
+            return await asyncio.run(
+                self.speech_to_speech_async(audio_file_path, rag_response, voice, language)
+            )
     
     def cleanup_temp_files(self):
         """Geçici dosyaları temizle"""

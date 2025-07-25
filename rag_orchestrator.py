@@ -53,7 +53,7 @@ class RAGOrchestrator:
         
         # Phase 5: Intelligent Context Assembly
         print("🔧 Phase 5: Intelligent Context Assembly")
-        assembled_context = self.context_assembler.assemble_intelligent_context(
+        assembled_context = await self.context_assembler.assemble_intelligent_context_async(
             search_results, question, user_context, 
             sub_questions=analysis.sub_questions if analysis.is_complex else None
         )
@@ -103,7 +103,7 @@ class RAGOrchestrator:
             
             # Phase 5: Context Assembly
             await check_disconnection("context assembly")
-            assembled_context = self.context_assembler.assemble_intelligent_context(
+            assembled_context = await self.context_assembler.assemble_intelligent_context_async(
                 search_results, question, user_context,
                 sub_questions=analysis.sub_questions if analysis.is_complex else None
             )
@@ -146,7 +146,7 @@ class RAGOrchestrator:
                 all_queries, query_vectors, collection, use_reranking=True
             )
             
-            assembled_context = self.context_assembler.assemble_intelligent_context(
+            assembled_context = await self.context_assembler.assemble_intelligent_context_async(
                 search_results, question, user_context,
                 sub_questions=analysis.sub_questions if analysis.is_complex else None
             )
@@ -288,5 +288,5 @@ async def ask_question_stream(question, collection, openai_client, model, cross_
 # Keep the optimized embeddings function for document processing
 async def create_optimized_embeddings(documents, model):
     """Backward compatibility for document processing"""
-    embedding_engine = EmbeddingEngine(model)
+    embedding_engine = SemanticEmbeddingEngine(model) # Changed from EmbeddingEngine to SemanticEmbeddingEngine
     return await embedding_engine.create_optimized_embeddings(documents) 

@@ -9,9 +9,10 @@ import concurrent.futures
 import numpy as np
 from typing import List, Dict, Tuple
 import asyncio
+import aiofiles
 
 class SemanticDocumentProcessor:
-    """Advanced semantic document processor with content-aware chunking"""
+    """Advanced semantic document processor with content-aware chunking and async I/O"""
     
     def __init__(self, embedding_model=None):
         self.embedding_model = embedding_model
@@ -471,28 +472,35 @@ class SemanticDocumentProcessor:
         
         return None
 
-def _process_single_file_semantic(file_path, processor):
-    """Process a single file with semantic awareness"""
+async def _process_single_file_semantic(file_path, processor):
+    """Process a single file with semantic awareness and async processing"""
     filename = os.path.basename(file_path)
     docs = []
     
     try:
-        reader = pypdf.PdfReader(file_path)
-        full_text = ""
+        # Use asyncio.to_thread for CPU-intensive PDF reading
+        def read_pdf_content():
+            reader = pypdf.PdfReader(file_path)
+            full_text = ""
+            
+            for page in reader.pages:
+                page_text = page.extract_text() or ""
+                full_text += page_text
+            
+            if not full_text.strip():
+                print(f"Warning: No text extracted from {filename}, using filename as content")
+                full_text = f"Document: {filename}\nContent could not be extracted from this PDF file."
+            
+            return full_text
         
-        for page in reader.pages:
-            page_text = page.extract_text() or ""
-            full_text += page_text
+        # Run PDF reading in thread to avoid blocking
+        full_text = await asyncio.to_thread(read_pdf_content)
         
-        if not full_text.strip():
-            print(f"Warning: No text extracted from {filename}, using filename as content")
-            full_text = f"Document: {filename}\nContent could not be extracted from this PDF file."
-
-        # Detect document structure
-        structure = processor.detect_document_structure(full_text)
+        # Detect document structure (CPU-intensive, use thread)
+        structure = await asyncio.to_thread(processor.detect_document_structure, full_text)
         
-        # Create semantic chunks
-        semantic_chunks = processor.create_semantic_chunks(full_text, structure)
+        # Create semantic chunks (CPU-intensive, use thread)
+        semantic_chunks = await asyncio.to_thread(processor.create_semantic_chunks, full_text, structure)
         
         # Convert to standard format
         for chunk_data in semantic_chunks:
@@ -519,8 +527,8 @@ def _process_single_file_semantic(file_path, processor):
     
     return docs
 
-def load_and_process_documents(directory_path, specific_files=None, embedding_model=None):
-    """Load and process documents with semantic awareness"""
+async def load_and_process_documents_async(directory_path, specific_files=None, embedding_model=None):
+    """Load and process documents with semantic awareness and async processing"""
     all_docs = []
     
     if not os.path.exists(directory_path):
@@ -538,17 +546,43 @@ def load_and_process_documents(directory_path, specific_files=None, embedding_mo
 
     file_paths = [os.path.join(directory_path, f) for f in filenames_to_process]
     
-    print(f"🧠 Processing {len(file_paths)} documents with semantic chunking...")
+    print(f"🧠 Processing {len(file_paths)} documents with semantic chunking (ASYNC)...")
 
-    with concurrent.futures.ThreadPoolExecutor() as executor:
-        future_to_path = {
-            executor.submit(_process_single_file_semantic, path, processor): path 
-            for path in file_paths
-        }
+    # Process files in parallel using async
+    batch_size = 3  # Process 3 files concurrently to avoid overwhelming system
+    
+    for i in range(0, len(file_paths), batch_size):
+        batch_paths = file_paths[i:i+batch_size]
         
-        for future in tqdm(concurrent.futures.as_completed(future_to_path), 
-                          total=len(file_paths), desc="Semantic Processing"):
-            all_docs.extend(future.result())
+        # Create tasks for this batch
+        tasks = [_process_single_file_semantic(path, processor) for path in batch_paths]
+        
+        # Process batch and collect results
+        batch_results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Add successful results
+        for result in batch_results:
+            if isinstance(result, list):  # Successful processing returns list of docs
+                all_docs.extend(result)
+            else:
+                print(f"❌ Error in batch processing: {result}")
             
-    print(f"✅ Semantic processing complete: {len(all_docs)} total chunks")
-    return all_docs 
+    print(f"✅ Async semantic processing complete: {len(all_docs)} total chunks")
+    return all_docs
+
+# Backward compatibility - sync wrapper
+def load_and_process_documents(directory_path, specific_files=None, embedding_model=None):
+    """Sync wrapper for load_and_process_documents_async"""
+    try:
+        # Try to get existing event loop
+        loop = asyncio.get_running_loop()
+        # If we're in an async context, create a task
+        return asyncio.run_coroutine_threadsafe(
+            load_and_process_documents_async(directory_path, specific_files, embedding_model),
+            loop
+        ).result()
+    except RuntimeError:
+        # No event loop running, create new one
+        return asyncio.run(
+            load_and_process_documents_async(directory_path, specific_files, embedding_model)
+        ) 
