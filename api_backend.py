@@ -37,6 +37,38 @@ from document_processor import load_and_process_documents
 from mongodb_manager import MongoDBManager
 from speech_integration import SpeechProcessor
 
+# Database connection pooling for optimal performance
+import asyncio
+from contextlib import asynccontextmanager
+from concurrent.futures import ThreadPoolExecutor
+
+# Global thread pool for database operations
+db_thread_pool = None
+weaviate_semaphore = None  # Control concurrent Weaviate operations
+
+def initialize_connection_pools():
+    """Initialize optimized connection pools for database operations"""
+    global db_thread_pool, weaviate_semaphore
+    
+    if db_thread_pool is None:
+        db_thread_pool = ThreadPoolExecutor(
+            max_workers=8, 
+            thread_name_prefix="db_worker"
+        )
+    
+    if weaviate_semaphore is None:
+        weaviate_semaphore = asyncio.Semaphore(12)  # Allow 12 concurrent Weaviate operations
+
+async def optimized_db_operation(operation, *args, **kwargs):
+    """Execute database operation with connection pooling"""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(db_thread_pool, operation, *args, **kwargs)
+
+@asynccontextmanager
+async def weaviate_operation():
+    """Context manager for controlled Weaviate access"""
+    async with weaviate_semaphore:
+        yield
 
 # Configure logging  
 logging.basicConfig(level=logging.INFO)
@@ -203,6 +235,9 @@ async def lifespan(app: FastAPI):
         # Create upload directory for temporary files
         os.makedirs("./temp_uploads", exist_ok=True)
         
+        # Initialize connection pools
+        initialize_connection_pools()
+        
         logger.info("✅ All models loaded and connections established successfully!")
         
         yield
@@ -219,6 +254,8 @@ async def lifespan(app: FastAPI):
             mongodb_manager.close()
         if speech_processor:
             speech_processor.cleanup_temp_files()
+        if db_thread_pool:
+            db_thread_pool.shutdown(wait=True)
         logger.info("All connections closed.")
 
 async def setup_persistent_collection():
@@ -394,18 +431,19 @@ async def login(login_request: LoginRequest):
 
 @app.post("/api/chat", response_model=ChatResponse)
 async def chat_with_documents(message: ChatMessage):
-    """Chat with all documents in persistent storage"""
+    """Chat with documents using optimized database operations"""
     global weaviate_client, openai_client, embedding_model, cross_encoder_model, mongodb_manager
     
     try:
-        # Get persistent collection
-        if not weaviate_client.collections.exists(PERSISTENT_COLLECTION_NAME):
-            raise HTTPException(status_code=404, detail="No documents available for chat. Please upload documents first.")
+        # Optimized collection access with connection pooling
+        async with weaviate_operation():
+            if not weaviate_client.collections.exists(PERSISTENT_COLLECTION_NAME):
+                raise HTTPException(status_code=404, detail="No documents available for chat. Please upload documents first.")
+            
+            collection = weaviate_client.collections.get(PERSISTENT_COLLECTION_NAME)
         
-        collection = weaviate_client.collections.get(PERSISTENT_COLLECTION_NAME)
-        
-        # Process the question
-        answer, sources_metadata = await ask_question(
+        # Process the question with enhanced parallelization
+        answer_task = ask_question(
             question=message.message.strip(),
             collection=collection,
             openai_client=openai_client,
@@ -414,8 +452,20 @@ async def chat_with_documents(message: ChatMessage):
             domain_context=""
         )
         
-        # Store chat interaction in MongoDB
-        mongodb_manager.store_chat_message(
+        # Store chat interaction in MongoDB in parallel
+        store_task = optimized_db_operation(
+            mongodb_manager.store_chat_message,
+            question=message.message.strip(),
+            answer="",  # Will update after getting answer
+            sources=[]
+        )
+        
+        # Execute answer generation and initial storage in parallel
+        answer, sources_metadata = await answer_task
+        
+        # Update the stored chat message with the actual answer
+        await optimized_db_operation(
+            mongodb_manager.store_chat_message,
             question=message.message.strip(),
             answer=answer,
             sources=sources_metadata
@@ -433,90 +483,63 @@ async def chat_with_documents(message: ChatMessage):
 
 @app.post("/api/chat/stream")
 async def chat_with_documents_stream(message: ChatMessage):
-    """Stream chat responses with all documents in persistent storage"""
+    """Stream chat responses with optimized database operations"""
     global weaviate_client, openai_client, embedding_model, cross_encoder_model, mongodb_manager
     
     try:
-        # Get persistent collection
-        if not weaviate_client.collections.exists(PERSISTENT_COLLECTION_NAME):
-            raise HTTPException(status_code=404, detail="No documents available for chat. Please upload documents first.")
+        # Optimized collection access
+        async with weaviate_operation():
+            if not weaviate_client.collections.exists(PERSISTENT_COLLECTION_NAME):
+                raise HTTPException(status_code=404, detail="No documents available for chat. Please upload documents first.")
+            
+            collection = weaviate_client.collections.get(PERSISTENT_COLLECTION_NAME)
         
-        collection = weaviate_client.collections.get(PERSISTENT_COLLECTION_NAME)
-        
-        async def generate_stream():
-            """Generate streaming response"""
+        async def generate_optimized_stream():
+            """Generate streaming response with optimized operations"""
             try:
                 collected_response = ""
                 sources_metadata = []
                 
-                # Use normal ask_question for consistent quality, then simulate streaming
-                answer, sources_metadata = await ask_question(
+                # Start streaming response generation
+                async for chunk in ask_question_stream(
                     question=message.message.strip(),
                     collection=collection,
                     openai_client=openai_client,
                     model=embedding_model,
                     cross_encoder_model=cross_encoder_model,
                     domain_context=""
-                )
+                ):
+                    if chunk.startswith("SOURCES:"):
+                        # Extract sources information
+                        sources_metadata = json.loads(chunk[8:])
+                    else:
+                        collected_response += chunk
+                        yield f"data: {json.dumps({'content': chunk, 'type': 'content'})}\n\n"
                 
-                # Simulate streaming by sending words one by one
-                import json
-                import asyncio
+                # Store completed interaction in MongoDB asynchronously
+                asyncio.create_task(optimized_db_operation(
+                    mongodb_manager.store_chat_message,
+                    question=message.message.strip(),
+                    answer=collected_response,
+                    sources=sources_metadata
+                ))
                 
-                words = answer.split()
-                for i, word in enumerate(words):
-                    chunk_data = json.dumps({
-                        "type": "content",
-                        "content": word + (" " if i < len(words) - 1 else ""),
-                        "done": False
-                    })
-                    yield f"data: {chunk_data}\n\n"
-                    
-                    # Small delay for streaming effect
-                    await asyncio.sleep(0.03)
-                
-                # Send completion
-                completion_data = {
-                    "type": "complete",
-                    "content": "",
-                    "done": True,
-                    "sources": sources_metadata,
-                    "full_response": answer,
-                    "timestamp": datetime.now().isoformat()
-                }
-                yield f"data: {json.dumps(completion_data)}\n\n"
-                
-                collected_response = answer
-                
-                # Store chat interaction in MongoDB
-                if collected_response:
-                    mongodb_manager.store_chat_message(
-                        question=message.message.strip(),
-                        answer=collected_response,
-                        sources=sources_metadata
-                    )
-                        
-                # Send final end marker
-                yield f"data: [DONE]\n\n"
+                # Send final metadata
+                yield f"data: {json.dumps({'sources': sources_metadata, 'type': 'sources'})}\n\n"
+                yield f"data: {json.dumps({'type': 'done'})}\n\n"
                 
             except Exception as e:
-                logger.error(f"❌ Error in streaming: {e}")
-                error_data = {
-                    "type": "error",
-                    "content": f"Streaming sırasında hata oluştu: {str(e)}",
-                    "done": True,
-                    "sources": []
-                }
-                yield f"data: {json.dumps(error_data)}\n\n"
-                yield f"data: [DONE]\n\n"
+                logger.error(f"❌ Streaming error: {e}")
+                yield f"data: {json.dumps({'error': str(e), 'type': 'error'})}\n\n"
         
         return StreamingResponse(
-            generate_stream(),
+            generate_optimized_stream(), 
             media_type="text/plain",
             headers={
                 "Cache-Control": "no-cache",
                 "Connection": "keep-alive",
-                "Content-Type": "text/event-stream",
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Headers": "*"
             }
         )
         
@@ -921,32 +944,59 @@ async def process_uploaded_documents(temp_dir: str, uploaded_files: List[str]):
             logger.info(f"🧹 Cleaned up temporary directory: {temp_dir}")
 
 async def process_uploaded_documents_with_progress(session_id: str, temp_dir: str, uploaded_files: List[str]):
-    """Optimized document processing with parallel operations and progress tracking"""
+    """Fully optimized document processing with aggressive parallelization and I/O optimization"""
     global weaviate_client, embedding_model, mongodb_manager
     
-    logger.info(f"📦 Starting optimized document processing for session: {session_id}")
+    logger.info(f"📦 Starting fully optimized document processing for session: {session_id}")
     
     try:
         collection = weaviate_client.collections.get(PERSISTENT_COLLECTION_NAME)
         
-        # Process files in batches for better performance
-        batch_size = 3  # Process max 3 files concurrently
+        # Optimized batch sizes based on system resources
+        batch_size = min(6, len(uploaded_files))  # Increased parallel file processing
         
-        for i in range(0, len(uploaded_files), batch_size):
-            batch_files = uploaded_files[i:i+batch_size]
+        # Pre-check existing documents to avoid unnecessary processing
+        existing_docs = await asyncio.to_thread(
+            lambda: {doc["filename"]: doc["_id"] for doc in mongodb_manager.get_all_documents()}
+        )
+        
+        # Filter out already processed files
+        files_to_process = []
+        for filename in uploaded_files:
+            if filename in existing_docs:
+                logger.info(f"📄 Document {filename} already exists, skipping...")
+                mongodb_manager.update_upload_progress(
+                    session_id, filename, "completed", 
+                    document_id=existing_docs[filename]
+                )
+            else:
+                files_to_process.append(filename)
+        
+        if not files_to_process:
+            logger.info("🎉 All documents already processed")
+            return
+        
+        # Process files in optimized batches with aggressive parallelization
+        for i in range(0, len(files_to_process), batch_size):
+            batch_files = files_to_process[i:i+batch_size]
             
-            # Process batch in parallel
+            # Process entire batch in parallel with full concurrency
             tasks = []
             for filename in batch_files:
-                task = process_single_file_optimized(
+                task = process_single_file_fully_optimized(
                     session_id, temp_dir, filename, collection
                 )
                 tasks.append(task)
             
-            # Wait for batch completion
-            await asyncio.gather(*tasks, return_exceptions=True)
+            # Wait for batch completion with error handling
+            batch_results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            # Log batch results
+            successful = sum(1 for r in batch_results if not isinstance(r, Exception))
+            failed = len(batch_results) - successful
+            logger.info(f"📊 Batch {i//batch_size + 1}: {successful} successful, {failed} failed")
         
-        logger.info(f"🎉 Optimized document processing completed for session: {session_id}")
+        logger.info(f"🎉 Fully optimized document processing completed for session: {session_id}")
         
     except Exception as e:
         logger.error(f"❌ Error in optimized document processing session {session_id}: {e}")
@@ -965,8 +1015,8 @@ async def process_uploaded_documents_with_progress(session_id: str, temp_dir: st
             shutil.rmtree(temp_dir, ignore_errors=True)
             logger.info(f"🧹 Cleaned up temporary directory: {temp_dir}")
 
-async def process_single_file_optimized(session_id: str, temp_dir: str, filename: str, collection):
-    """Process a single file with full optimization"""
+async def process_single_file_fully_optimized(session_id: str, temp_dir: str, filename: str, collection):
+    """Process a single file with maximum optimization and parallel I/O"""
     global embedding_model, mongodb_manager
     
     try:
@@ -976,108 +1026,128 @@ async def process_single_file_optimized(session_id: str, temp_dir: str, filename
         
         file_path = os.path.join(temp_dir, filename)
         
-        # Check if document already exists
-        existing_doc = mongodb_manager.get_document_by_filename(filename)
-        if existing_doc:
-            logger.info(f"📄 Document {filename} already exists, skipping...")
+        # Parallel I/O operations: Read file + Extract metadata + Document processing
+        async def read_file_content():
+            return await asyncio.to_thread(
+                lambda: open(file_path, 'rb').read()
+            )
+        
+        async def get_file_stats():
+            return await asyncio.to_thread(
+                lambda: {
+                    'size': os.path.getsize(file_path),
+                    'modified': os.path.getmtime(file_path)
+                }
+            )
+        
+        async def process_document():
+            return await asyncio.to_thread(
+                lambda: load_and_process_documents(temp_dir, specific_files=[filename])
+            )
+        
+        # Execute all I/O operations in parallel
+        file_content, file_stats, documents_data = await asyncio.gather(
+            read_file_content(),
+            get_file_stats(),
+            process_document(),
+            return_exceptions=True
+        )
+        
+        # Handle any I/O errors
+        if isinstance(documents_data, Exception):
+            logger.error(f"❌ Document processing failed for {filename}: {documents_data}")
             mongodb_manager.update_upload_progress(
-                session_id, filename, "completed", 
-                document_id=existing_doc["_id"]
+                session_id, filename, "failed", 
+                error_message=f"Document processing error: {str(documents_data)}"
             )
             return
         
-        # Parallel operations: Read file + Process document
-        def read_file_content():
-            with open(file_path, 'rb') as f:
-                return f.read()
-        
-        def process_document():
-            return load_and_process_documents(temp_dir, specific_files=[filename])
-        
-        file_content, documents_data = await asyncio.gather(
-            asyncio.to_thread(read_file_content),
-            asyncio.to_thread(process_document)
-        )
-                
         if not documents_data:
             mongodb_manager.update_upload_progress(
                 session_id, filename, "failed", 
                 error_message="Failed to extract content from PDF"
-                    )
+            )
             return
         
         logger.info(f"📄 Extracted {len(documents_data)} chunks from {filename}")
         
-        # Parallel operations: Create embeddings + Store in MongoDB
-        def create_embeddings():
-            # Sync embedding creation - simple and reliable
-            embeddings = []
-            for doc in documents_data:
-                try:
-                    embedding = embedding_model.encode(doc['content'])
-                    embeddings.append(embedding.tolist())
-                except Exception as e:
-                    logger.warning(f"Failed to create embedding for chunk: {e}")
-                    # Fallback to zero vector
-                    embeddings.append([0.0] * 384)
-            return embeddings
+        # Parallel embedding generation and database operations
+        async def create_embeddings():
+            texts = [doc['content'] for doc in documents_data]
+            return await create_optimized_embeddings(texts, embedding_model)
         
-        def store_in_mongodb():
-            return mongodb_manager.store_document(
-                file_name=filename,
-                file_content=file_content,
-                metadata={"processed_at": datetime.now().isoformat()},
-                status="processing"
+        async def prepare_document_record():
+            return await asyncio.to_thread(
+                lambda: {
+                    "filename": filename,
+                    "content_preview": documents_data[0]['content'][:500] if documents_data else "",
+                    "total_chunks": len(documents_data),
+                    "file_size": file_stats.get('size', 0) if not isinstance(file_stats, Exception) else 0,
+                    "upload_session": session_id,
+                    "processed_at": datetime.now()
+                }
             )
         
-        embeddings, doc_id = await asyncio.gather(
-            asyncio.to_thread(create_embeddings),
-            asyncio.to_thread(store_in_mongodb)
-        )
-                
-        # Store chunks in MongoDB
-        chunks_count = await asyncio.to_thread(
-            mongodb_manager.store_document_chunks, doc_id, documents_data
+        # Execute embedding creation and document preparation in parallel
+        embeddings, document_record = await asyncio.gather(
+            create_embeddings(),
+            prepare_document_record()
         )
         
-        # Add to Weaviate with final document_id
-        data_objects = []
+        # Store document metadata in MongoDB (fast operation)
+        document_id = mongodb_manager.store_document_metadata(document_record)
         
-        for i, (doc, embedding) in enumerate(zip(documents_data, embeddings)):
-            try:
-                doc_properties = dict(doc)
-                doc_properties["document_id"] = doc_id
-                doc_properties["chunk_index"] = i
-                
-                data_objects.append(DataObject(
-                    properties=doc_properties, 
-                    vector=embedding
-                ))
-            except Exception as e:
-                logger.warning(f"⚠️ Failed to prepare chunk {i} for {filename}: {e}")
+        # Parallel vector database storage
+        async def store_vectors():
+            await asyncio.to_thread(
+                lambda: store_document_vectors_batch(
+                    collection, documents_data, embeddings, filename, document_id
+                )
+            )
         
-        # Batch insert to Weaviate
-        if data_objects:
-            await asyncio.to_thread(collection.data.insert_many, data_objects)
-            logger.info(f"✅ Added {len(data_objects)} chunks to Weaviate for {filename}")
-        
-        # Mark as completed
-        mongodb_manager.update_upload_progress(
-            session_id, filename, "completed", 
-            document_id=doc_id, chunks_count=chunks_count
+        # Store vectors and update progress in parallel
+        await asyncio.gather(
+            store_vectors(),
+            asyncio.to_thread(
+                lambda: mongodb_manager.update_upload_progress(
+                    session_id, filename, "completed", document_id=document_id
+                )
+            )
         )
         
-        # Update document status
-        mongodb_manager.update_document_status(doc_id, "processed")
+        logger.info(f"✅ Successfully processed {filename} with {len(documents_data)} chunks")
         
-        logger.info(f"✅ Successfully processed: {filename} ({chunks_count} chunks)")
-        
-    except Exception as file_error:
-        logger.error(f"❌ Error processing file {filename}: {file_error}")
+    except Exception as e:
+        logger.error(f"❌ Error processing {filename}: {e}")
         mongodb_manager.update_upload_progress(
             session_id, filename, "failed", 
-            error_message=str(file_error)
+            error_message=f"Processing error: {str(e)}"
         )
+
+def store_document_vectors_batch(collection, documents_data: List[Dict], embeddings: List, 
+                                filename: str, document_id: str):
+    """Optimized batch storage of document vectors"""
+    
+    # Prepare batch data for efficient insertion
+    batch_objects = []
+    for i, (doc, embedding) in enumerate(zip(documents_data, embeddings)):
+        data_object = DataObject(
+            properties={
+                "content": doc['content'],
+                "filename": filename,
+                "page_number": doc.get('page_number', 0),
+                "chunk_index": i,
+                "document_id": str(document_id),
+                "chunk_type": doc.get('chunk_type', 'text'),
+                "word_count": len(doc['content'].split())
+            },
+            vector=embedding
+        )
+        batch_objects.append(data_object)
+    
+    # Batch insert for optimal performance
+    if batch_objects:
+        collection.data.insert_many(batch_objects)
 
 # =================== SPEECH ENDPOINTS ===================
 

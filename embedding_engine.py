@@ -12,12 +12,28 @@ import re
 # Embedding cache for performance
 embedding_cache = TTLCache(maxsize=3000, ttl=1200)  # Increased cache, 20 min TTL
 
-# Memory optimization: Object pool for frequent operations
+# Enhanced memory optimization with expanded pooling
 _temp_vector_pool = []
-_max_pool_size = 100
+_temp_array_pool = []  # Pool for numpy arrays
+_max_pool_size = 200   # Increased pool size
+_embedding_semaphore = asyncio.Semaphore(8)  # Control concurrent embeddings
+
+# Connection pooling for thread operations
+_thread_pool_executor = None
+
+def get_thread_pool():
+    """Get or create optimized thread pool for embedding operations"""
+    global _thread_pool_executor
+    if _thread_pool_executor is None:
+        import concurrent.futures
+        _thread_pool_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=6,  # Optimized for embedding operations
+            thread_name_prefix="embedding_worker"
+        )
+    return _thread_pool_executor
 
 class SemanticEmbeddingEngine:
-    """Advanced semantic embedding engine with content intelligence"""
+    """Advanced semantic embedding engine with enhanced memory management"""
     
     def __init__(self, embedding_model):
         self.embedding_model = embedding_model
@@ -112,53 +128,109 @@ class SemanticEmbeddingEngine:
         return enhanced_text
     
     def _get_temp_vector(self, size: int) -> np.ndarray:
-        """Get a temporary vector from pool or create new one"""
+        """Get a temporary vector from expanded pool"""
         if _temp_vector_pool:
             vector = _temp_vector_pool.pop()
             if len(vector) == size:
                 vector.fill(0)  # Reset values
                 return vector
-        return np.zeros(size)
+        return np.zeros(size, dtype=np.float32)  # Use float32 for memory efficiency
     
     def _return_temp_vector(self, vector: np.ndarray):
-        """Return vector to pool for reuse"""
+        """Return vector to expanded pool for reuse"""
         if len(_temp_vector_pool) < _max_pool_size:
             _temp_vector_pool.append(vector)
     
+    def _get_temp_array(self, shape) -> np.ndarray:
+        """Get temporary array from pool"""
+        target_size = np.prod(shape)
+        for i, arr in enumerate(_temp_array_pool):
+            if arr.size >= target_size:
+                # Remove from pool and reshape
+                array = _temp_array_pool.pop(i)
+                return array.reshape(shape)[:np.prod(shape)].reshape(shape)
+        
+        return np.zeros(shape, dtype=np.float32)
+    
+    def _return_temp_array(self, array: np.ndarray):
+        """Return array to pool"""
+        if len(_temp_array_pool) < _max_pool_size:
+            _temp_array_pool.append(array.flatten())
+    
     async def create_semantic_query_embeddings(self, queries: List[str]) -> List[np.ndarray]:
-        """Create semantically enhanced embeddings for queries"""
+        """Create semantically enhanced embeddings with advanced memory management"""
         
         print(f"🧠 Creating semantic embeddings for {len(queries)} queries")
         
-        embeddings = []
-        cache_hits = 0
+        if not queries:
+            return []
         
-        # Enhance queries for better semantic understanding
-        enhanced_queries = []
-        for query in queries:
-            content_type = self.detect_content_type(query)
-            enhanced_query = self.enhance_text_for_embedding(query, content_type)
-            enhanced_queries.append(enhanced_query)
-        
-        # Check cache and generate embeddings
-        for i, (original_query, enhanced_query) in enumerate(zip(queries, enhanced_queries)):
-            normalized_query = original_query.strip().lower()
-            cache_key = f"semantic_query_emb_{hash(normalized_query)}"
+        async with _embedding_semaphore:  # Control concurrency
+            embeddings = []
+            cache_hits = 0
+            uncached_queries = []
             
-            if cache_key in embedding_cache:
-                embeddings.append(embedding_cache[cache_key])
-                cache_hits += 1
-            else:
-                # Generate embedding with enhancement
-                embedding = await asyncio.to_thread(self.embedding_model.encode, enhanced_query)
-                embedding_array = np.array(embedding)
-                embedding_cache[cache_key] = embedding_array
-                embeddings.append(embedding_array)
-        
-        if cache_hits > 0:
-            print(f"🚀 Semantic embedding cache hits: {cache_hits}/{len(queries)}")
-        
-        return embeddings
+            # Enhance queries for better semantic understanding
+            enhanced_queries = []
+            for query in queries:
+                content_type = self.detect_content_type(query)
+                enhanced_query = self.enhance_text_for_embedding(query, content_type)
+                enhanced_queries.append(enhanced_query)
+            
+            # First pass: Check cache and collect uncached queries
+            embeddings = [None] * len(queries)  # Pre-allocate with None placeholders
+            
+            for i, (original_query, enhanced_query) in enumerate(zip(queries, enhanced_queries)):
+                normalized_query = original_query.strip().lower()
+                cache_key = f"semantic_query_emb_{hash(normalized_query)}"
+                
+                if cache_key in embedding_cache:
+                    embeddings[i] = embedding_cache[cache_key]
+                    cache_hits += 1
+                else:
+                    uncached_queries.append((enhanced_query, cache_key, i))
+            
+            # Second pass: Process uncached queries with optimized threading
+            if uncached_queries:
+                batch_size = min(16, len(uncached_queries))  # Optimal batch size
+                
+                async def process_embedding_batch(batch):
+                    enhanced_texts = [item[0] for item in batch]
+                    
+                    # Use optimized thread pool for better resource management
+                    loop = asyncio.get_event_loop()
+                    batch_embeddings = await loop.run_in_executor(
+                        get_thread_pool(),
+                        lambda: self.embedding_model.encode(
+                            enhanced_texts,
+                            batch_size=len(enhanced_texts),
+                            show_progress_bar=False,
+                            normalize_embeddings=True,
+                            convert_to_numpy=True  # Direct numpy conversion
+                        )
+                    )
+                    
+                    # Store in cache and results with memory pooling
+                    for (enhanced_text, cache_key, original_index), embedding in zip(batch, batch_embeddings):
+                        # Use memory pool for consistent array management
+                        embedding_array = self._get_temp_vector(len(embedding))
+                        embedding_array[:] = embedding  # Copy data
+                        
+                        embedding_cache[cache_key] = embedding_array.copy()  # Cache gets a copy
+                        embeddings[original_index] = embedding_array
+                
+                # Process all batches in parallel with controlled concurrency
+                tasks = []
+                for i in range(0, len(uncached_queries), batch_size):
+                    batch = uncached_queries[i:i+batch_size]
+                    tasks.append(process_embedding_batch(batch))
+                
+                await asyncio.gather(*tasks)
+            
+            if cache_hits > 0:
+                print(f"🚀 Semantic embedding cache hits: {cache_hits}/{len(queries)}")
+            
+            return embeddings
     
     # Backward compatibility
     async def create_query_embeddings(self, queries: List[str]) -> List[np.ndarray]:

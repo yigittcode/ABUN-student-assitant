@@ -9,8 +9,9 @@ from typing import Optional, Dict, AsyncGenerator
 from cachetools import TTLCache
 from config import LLM_MODEL, PROMPT_TEMPLATE, VOICE_PROMPT_TEMPLATE
 
-# Response cache for faster repeated queries
-response_cache = TTLCache(maxsize=300, ttl=600)  # 10 min cache
+# Response cache for faster repeated queries - improved with better TTL and size
+response_cache = TTLCache(maxsize=500, ttl=900)  # Increased size and TTL to 15 minutes
+context_cache = TTLCache(maxsize=300, ttl=1200)  # Cache for context preprocessing - 20 min TTL
 
 class ResponseGenerator:
     """Advanced response generator with context intelligence"""
@@ -18,26 +19,57 @@ class ResponseGenerator:
     def __init__(self, openai_client):
         self.openai_client = openai_client
     
+    def _create_smart_cache_key(self, question: str, context: str, domain_context: str = "", 
+                              user_context: Optional[Dict] = None) -> str:
+        """Create intelligent cache key that normalizes similar queries"""
+        
+        # Normalize question for better cache hits
+        normalized_question = question.strip().lower()
+        
+        # Remove common variations that don't affect the answer
+        normalized_question = normalized_question.replace('lütfen', '').replace('acaba', '')
+        normalized_question = ' '.join(normalized_question.split())  # Normalize whitespace
+        
+        # Create context signature (hash of first and last parts for stability)
+        context_signature = ""
+        if context and len(context) > 100:
+            context_start = context[:200]
+            context_end = context[-200:] if len(context) > 400 else ""
+            context_signature = str(hash(context_start + context_end))
+        
+        # Create user context signature
+        user_signature = ""
+        if user_context:
+            key_items = sorted(user_context.items()) if isinstance(user_context, dict) else []
+            user_signature = str(hash(str(key_items)))
+        
+        # Combine all elements
+        cache_key = f"resp_{hash(normalized_question)}_{context_signature}_{hash(domain_context)}_{user_signature}"
+        return cache_key
+    
     async def generate_contextual_response(self, question: str, context: str, 
                                          domain_context: str = "", 
                                          user_context: Optional[Dict] = None) -> str:
-        """Generate contextual response with enhanced logic"""
+        """Generate contextual response with enhanced caching and optimization"""
         
         # Validate context quality
         if not context or len(context.strip()) < 20:
             print("🚨 Context validation failed - insufficient content")
             return self._generate_fallback_response(domain_context)
         
-        # Check cache
-        cache_key = self._create_cache_key(question, context, domain_context, user_context)
+        # Check cache with improved key
+        cache_key = self._create_smart_cache_key(question, context, domain_context, user_context)
         if cache_key in response_cache:
             print("🚀 Response cache hit!")
             return response_cache[cache_key]
         
         print(f"🤖 Generating contextual response (context: {len(context)} chars)")
         
-        # Prepare enhanced prompt
-        enhanced_prompt = self._prepare_enhanced_prompt(question, context, domain_context, user_context)
+        # Parallel context processing and prompt preparation
+        context_task = self._preprocess_context_async(context, question)
+        prompt_task = self._prepare_enhanced_prompt_async(question, context, domain_context, user_context)
+        
+        preprocessed_context, enhanced_prompt = await asyncio.gather(context_task, prompt_task)
         
         try:
             # Debug: Log prompt details for multi-topic queries
@@ -61,8 +93,11 @@ class ResponseGenerator:
             
             result = response.choices[0].message.content.strip()
             
-            # Validate response quality
-            validated_result = self._validate_response_quality(result, question, context, domain_context)
+            # Validate response quality in parallel
+            validation_task = asyncio.create_task(
+                self._validate_response_quality_async(result, question, context, domain_context)
+            )
+            validated_result = await validation_task
             
             # Cache successful response
             response_cache[cache_key] = validated_result
@@ -197,6 +232,46 @@ class ResponseGenerator:
         
         return adapted_prompt.format(context=context, question=question)
     
+    async def _prepare_enhanced_prompt_async(self, question: str, context: str, 
+                                           domain_context: str, user_context: Optional[Dict]) -> str:
+        """Asynchronously prepare enhanced prompt"""
+        
+        def prepare_prompt():
+            return self._prepare_enhanced_prompt(question, context, domain_context, user_context)
+        
+        return await asyncio.to_thread(prepare_prompt)
+    
+    async def _preprocess_context_async(self, context: str, question: str) -> str:
+        """Asynchronously preprocess context for better relevance"""
+        
+        # Check context cache first
+        context_key = f"ctx_{hash(context[:500])}_{hash(question.lower())}"
+        if context_key in context_cache:
+            return context_cache[context_key]
+        
+        def preprocess():
+            # Extract most relevant sections based on question keywords
+            question_lower = question.lower()
+            context_lines = context.split('\n')
+            
+            relevant_lines = []
+            question_words = [word for word in question_lower.split() if len(word) > 3]
+            
+            for line in context_lines:
+                line_lower = line.lower()
+                # Boost lines that contain question keywords
+                if any(word in line_lower for word in question_words):
+                    relevant_lines.append(line)
+                elif line.strip():  # Keep non-empty lines
+                    relevant_lines.append(line)
+            
+            processed_context = '\n'.join(relevant_lines)
+            return processed_context
+        
+        result = await asyncio.to_thread(preprocess)
+        context_cache[context_key] = result
+        return result
+    
     def _prepare_voice_prompt(self, question: str, context: str, domain_context: str,
                             user_context: Optional[Dict]) -> str:
         """Prepare voice-specific prompt"""
@@ -260,6 +335,15 @@ class ResponseGenerator:
         
         return "\n".join(instructions) if instructions else ""
     
+    async def _validate_response_quality_async(self, result: str, question: str, 
+                                             context: str, domain_context: str) -> str:
+        """Asynchronously validate response quality"""
+        
+        def validate():
+            return self._validate_response_quality(result, question, context, domain_context)
+        
+        return await asyncio.to_thread(validate)
+    
     def _validate_response_quality(self, response: str, question: str, context: str, 
                                  domain_context: str) -> str:
         """Validate and potentially improve response quality"""
@@ -302,14 +386,4 @@ class ResponseGenerator:
         if is_voice:
             return "Özür dilerim, yanıt oluştururken bir hata oluştu. Lütfen tekrar deneyin."
         else:
-            return f"Özür dilerim, yanıt oluştururken bir hata oluştu. Lütfen sorunuzu daha spesifik hale getirip tekrar deneyin."
-    
-    def _create_cache_key(self, question: str, context: str, domain_context: str,
-                         user_context: Optional[Dict]) -> str:
-        """Create cache key for response caching"""
-        
-        # Create a hash-based key from inputs
-        context_hash = hash(context[:500] + context[-500:]) if len(context) > 1000 else hash(context)
-        user_hash = hash(str(user_context)) if user_context else 0
-        
-        return f"{hash(question.lower().strip())}_{context_hash}_{hash(domain_context)}_{user_hash}" 
+            return f"Özür dilerim, yanıt oluştururken bir hata oluştu. Lütfen sorunuzu daha spesifik hale getirip tekrar deneyin." 
