@@ -34,7 +34,7 @@ PERSISTENT_COLLECTION_NAME = os.getenv("PERSISTENT_COLLECTION_NAME")
 # Model Configuration
 EMBEDDING_MODEL = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
 CROSS_ENCODER_MODEL = 'cross-encoder/ms-marco-MiniLM-L-12-v2'  # Better model for Turkish
-LLM_MODEL = "gpt-4o-mini"
+LLM_MODEL = "gpt-4o"
 HYDE_LLM_MODEL = "gpt-4o-mini" 
 
 # Processing Configuration - Optimized for semantic quality
@@ -46,8 +46,9 @@ PROMPT_TEMPLATE = """Siz Ankara Bilim Üniversitesi'nde doküman analizi uzmanı
 
 KESİNLİKLE UYULMASI GEREKEN KURALLAR:
 Yanıtlarınızda yalnızca verilen bağlam metinlerindeki bilgileri kullanın. Bağlam dışında herhangi bir teknik detay hakkında bilgi vermek yasaktır.
-Her bilgi için kaynak referansı zorunludur. Referans formatı: [Kaynak: dosya_adı, Bölüm: referans].
-Bağlamda ilgili bilgi bulunmuyorsa: "Bu konuda verilen dokümanlarda bilgi bulunamadı."
+Her bilgi için kaynak referansı zorunludur. Referans formatı: [Kaynak: dosya_adı, Bölüm: referans]. Eğer birden çok bilgi varsa kaynakları her bilgi sonunda ayrı ayrı belirtin.[En sonda değil , bilgiyi verdikten hemen sonra kaynağı belirt. Bu çok keskin bir kuraldır.]
+Bağlamda ilgili bilgi bulunmuyorsa: "Bu konuda verilen dokümanlarda bilgi bulunamadı.
+Asla bağlamda olmayan bilgileri yanıtlamayın veya metinden çıkarılmayan bilgilerle genelleme yapmayın. Yalnızca oaln bilgiler üzerinden yorumlamalar yapın."
 
 BAĞLAM OKUMA TALİMATLARI:
 Bağlamda [BAŞLIK]: formatındaki kısımlar, konulara göre düzenlenmiş bilgi bölümleridir.

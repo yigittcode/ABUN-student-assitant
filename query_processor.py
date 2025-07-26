@@ -84,7 +84,17 @@ Bu sorunun:
 
 belirle.
 
-ÖNEMLI: Basit bilgi talepleri (örn: "X hakkında bilgi ver") COMPLEX değildir!
+CRITICAL: Şu durumlar KESINLIKLE SIMPLE (complex=false) olarak işaretlenmelidir:
+- Tek bir spesifik bilgi talebi (örn: "X nedir?", "Y hakkında bilgi ver")
+- Kişisel duruma dayalı tek soru (örn: "Ben X durumundayım, neden Y oldu?")
+- Basit sebep-sonuç soruları (örn: "Neden Z alamadım?")
+- Kuralların açıklanması talebi (örn: "X kuralları nelerdir?")
+
+COMPLEX olarak işaretlenmesi gereken durumlar:
+- Birden fazla ayrı konuda soru
+- Karşılaştırma gerektiren sorular (X ile Y arasındaki fark)
+- Conditional logic (eğer X ise Y ne olur?)
+- Multi-step prosedürler (nasıl X yapılır ve sonra Y ne olur?)
 
 Soru: "{query}"
 
@@ -134,6 +144,15 @@ Kesinlikle sadece JSON formatında yanıt ver:
                 confidence=analysis_data.get('confidence', 0.5)
             )
             
+            # Post-processing: Override with local detection for better accuracy
+            override_applied = False
+            if result.is_complex and self._is_simple_info_request(query):
+                print(f"   🔧 OVERRIDE: Detected as simple despite AI marking as complex")
+                result.is_complex = False
+                result.sub_questions = []
+                result.relationships = ['single']
+                override_applied = True
+            
             # Detailed logging
             print(f"   ✅ Analysis Result:")
             print(f"      • Complex: {result.is_complex}")
@@ -142,8 +161,8 @@ Kesinlikle sadece JSON formatında yanıt ver:
             print(f"      • Intent: {result.primary_intent}")
             print(f"      • Confidence: {result.confidence}")
             
-            # Validation check - warn if simple query marked as complex
-            if result.is_complex and self._is_simple_info_request(query):
+            # Validation check - warn if simple query marked as complex (only if no override applied)
+            if result.is_complex and self._is_simple_info_request(query) and not override_applied:
                 print(f"   ⚠️ WARNING: Simple info request marked as complex!")
                 print(f"      • Query seems like basic info request")
                 print(f"      • Consider adjusting analysis logic")
@@ -166,24 +185,59 @@ Kesinlikle sadece JSON formatında yanıt ver:
             )
     
     def _is_simple_info_request(self, query: str) -> bool:
-        """Check if query is a simple information request"""
+        """Enhanced check if query is a simple information request"""
         query_lower = query.lower().strip()
         
-        # Simple info request patterns
+        # Simple info request patterns - ENHANCED
         simple_patterns = [
-            r'.*hakkında bilgi.*',
+            # Direct questions
             r'.*nedir\?*$',
-            r'.*anlat.*',
+            r'.*kimdir\?*$', 
+            r'.*nelerdir\?*$',
+            r'.*hangileridir\?*$',
+            
+            # Information requests
+            r'.*hakkında bilgi.*',
+            r'.*bilgilerini.*',
             r'.*açıkla.*',
+            r'.*anlat.*',
             r'.*what is.*',
             r'.*tell me about.*',
-            r'.*explain.*'
+            r'.*explain.*',
+            
+            # Personal situation questions (CRITICAL - these are simple!)
+            r'ben .* neden .*\?*$',
+            r'benim .* neden .*\?*$',
+            r'.*alamadım.*neden.*\?*$',
+            r'.*alamıyorum.*neden.*\?*$',
+            r'.*olamadım.*neden.*\?*$',
+            r'.*sebebi nedir\?*$',
+            r'.*nedeni nedir\?*$',
+            
+            # Rules and procedures
+            r'.*kuralları.*',
+            r'.*kriterleri.*',
+            r'.*şartları.*',
+            r'.*prosedürü.*',
+            r'.*nasıl yapılır.*',
+            
+            # Single factual queries
+            r'^[^,]*\?*$',  # Single sentence ending with ?
         ]
         
         for pattern in simple_patterns:
             if re.match(pattern, query_lower):
                 return True
-                
+        
+        # Additional heuristics for simple queries
+        # If query contains personal pronouns and single question mark, likely simple
+        if ('ben ' in query_lower or 'benim ' in query_lower) and query_lower.count('?') <= 1:
+            return True
+            
+        # If query is short and has only one question mark, likely simple
+        if len(query.split()) <= 12 and query_lower.count('?') <= 1:
+            return True
+            
         return False
     
     async def generate_query_variants(self, original_query: str, user_context: Optional[Dict] = None) -> QueryVariants:

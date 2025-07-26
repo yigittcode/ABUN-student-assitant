@@ -60,39 +60,35 @@ class SearchEngine:
                 'dekan',
                 'başkan'
             ],
-            'burs': [
-                'burs türleri',
-                'başarı bursu',
-                'ihtiyaç bursu', 
-                'ösym bursu',
-                'tam burslu',
-                'kısmi burslu',
-                'indirim oranları'
-            ],
-            'yurt': [
-                'öğrenci yurdu',
-                'anlaşmalı yurtlar',
-                'barınma imkanları',
-                'konaklama seçenekleri',
-                'yurt fiyatları',
-                'yurt başvuru'
-            ],
-            'kayıt': [
-                'öğrenci kayıt',
-                'kayıt yenileme',
-                'akademik kayıt',
-                'ders kayıt',
-                'kayıt işlemleri',
-                'kayıt tarihleri'
-            ],
-            'sınav': [
-                'final sınavı',
-                'ara sınav',
-                'sınav tarihleri',
-                'sınav sistemi',
-                'değerlendirme kriterleri',
-                'not sistemi'
-            ]
+
+        }
+        
+        # Progressive search widening configuration
+        self.search_levels = {
+            'level_1_exact': {
+                'description': 'Exact specific search',
+                'broadening_factor': 0,
+                'semantic_weight': 0.7,
+                'keyword_weight': 0.3
+            },
+            'level_2_moderate': {
+                'description': 'Moderate broadening',
+                'broadening_factor': 1,
+                'semantic_weight': 0.6,
+                'keyword_weight': 0.4
+            },
+            'level_3_broad': {
+                'description': 'Broad semantic search',
+                'broadening_factor': 2,
+                'semantic_weight': 0.8,
+                'keyword_weight': 0.2
+            },
+            'level_4_maximum': {
+                'description': 'Maximum generalization',
+                'broadening_factor': 3,
+                'semantic_weight': 0.9,
+                'keyword_weight': 0.1
+            }
         }
     
     def _expand_query_terms(self, query: str) -> List[str]:
@@ -139,103 +135,133 @@ class SearchEngine:
     
     async def execute_multi_search(self, queries: List[str], query_vectors: List[np.ndarray], 
                                  collection, use_reranking: bool = True) -> List[Dict]:
-        """Execute multiple queries in parallel and combine results with result caching"""
+        """Enhanced multi-search with progressive widening fallback"""
         
-        import time
-        start_time = time.time()
+        print(f"🔍 Executing progressive multi-search for {len(queries)} queries")
         
-        print(f"🔍 Executing multi-search for {len(queries)} queries")
-        print(f"🗂️ Current cache size: {len(self.search_result_cache)}/{self.search_result_cache.maxsize}")
-        
-        # FIXED: More stable cache key generation
-        queries_sorted = sorted([q.lower().strip() for q in queries])  # Normalize queries
-        queries_hash = hash(tuple(queries_sorted))  # Use tuple for stable hashing
-        
-        # Simpler cache key without vector hashing for now
-        multi_search_cache_key = f"multi_search_{queries_hash}_{len(queries)}"
-        
-        # Check multi-search cache with better logging
-        if multi_search_cache_key in self.search_result_cache:
-            cache_time = time.time() - start_time
-            print(f"🚀 MULTI-SEARCH CACHE HIT! Saved ~8-12 seconds (lookup: {cache_time:.3f}s)")
-            return self.search_result_cache[multi_search_cache_key]
-        
-        print(f"💾 Cache miss - executing fresh multi-search (key: {multi_search_cache_key})")
-        print(f"🔍 Cache keys: {list(self.search_result_cache.keys())[:3]}...")  # Show first 3 keys for debugging
-        
-        # Execute all searches in parallel
-        search_start = time.time()
-        search_tasks = []
-        for i, query in enumerate(queries):
-            query_vector = query_vectors[i] if i < len(query_vectors) else None
-            task = self._perform_single_hybrid_search(query, query_vector, collection)
-            search_tasks.append(task)
-        
-        # Wait for all searches to complete
-        all_results = await asyncio.gather(*search_tasks)
-        search_time = time.time() - search_start
-        
-        # CRITICAL FIX: Check if we actually got cached results (search_time near 0)
-        if search_time < 0.1:  # If search was super fast, it was likely cached at lower level
-            print(f"🚀 LOWER-LEVEL CACHE HIT! Individual searches cached (time: {search_time:.3f}s)")
-        else:
-            print(f"⏱️ Fresh search execution time: {search_time:.2f}s")
-        
-        # Combine and deduplicate results
-        combine_start = time.time()
-        combined_results = self._combine_multi_search_results(all_results)
-        combine_time = time.time() - combine_start
-        print(f"⏱️ Result combination time: {combine_time:.3f}s")
-        
-        # Smart re-ranking: Only for complex queries or uncertain results
-        rerank_start = time.time()
-        if use_reranking and self.cross_encoder_model and combined_results:
-            primary_query = queries[0]  # Use first query as primary
+        # Try progressive search levels until we get sufficient results
+        for level_name, level_config in self.search_levels.items():
+            print(f"🎯 Trying {level_config['description']} (Level: {level_name})")
             
-            # Skip re-ranking for simple, high-confidence results  
-            if len(queries) <= 4 and len(combined_results) <= 8:
-                top_scores = [r['score'] for r in combined_results[:3]]
-                if len(top_scores) > 1:
-                    score_variance = max(top_scores) - min(top_scores)
-                    if score_variance > 0.15:  # High confidence, skip re-ranking
-                        print("🚀 Skipping re-ranking (high confidence results)")
-                        final_results = combined_results[:15]
-                    else:
-                        reranked_results = await self._intelligent_rerank(primary_query, combined_results)
-                        final_results = reranked_results
-                else:
-                    final_results = combined_results[:15]
-            else:
-                reranked_results = await self._intelligent_rerank(primary_query, combined_results)
-                final_results = reranked_results
-        else:
-            final_results = combined_results[:25]  # Return top 25 results for better coverage
-        
-        rerank_time = time.time() - rerank_start
-        print(f"⏱️ Re-ranking time: {rerank_time:.3f}s")
-        
-        # Cache the complete result
-        try:
-            self.search_result_cache[multi_search_cache_key] = final_results
-            print(f"✅ Successfully cached {len(final_results)} results with key: {multi_search_cache_key}")
-            print(f"🗂️ Cache size after write: {len(self.search_result_cache)}/{self.search_result_cache.maxsize}")
-            print(f"⏰ Cache TTL: {self.search_result_cache.ttl} seconds")
+            # Adjust queries based on broadening factor
+            adjusted_queries = self._broaden_queries(queries, level_config['broadening_factor'])
             
-            # Verify the write was successful
-            if multi_search_cache_key in self.search_result_cache:
-                print(f"✅ Cache write verification successful!")
-            else:
-                print(f"❌ Cache write verification FAILED!")
-                
-        except Exception as e:
-            print(f"❌ Cache write error: {e}")
+            # Execute search with level-specific weights
+            results = await self._execute_search_level(
+                adjusted_queries, query_vectors, collection, level_config, use_reranking
+            )
+            
+            # Evaluate result quality
+            quality_score = self._evaluate_search_quality(results, queries[0])
+            print(f"   📊 Quality score: {quality_score:.2f}")
+            
+            # If we have sufficient quality results, return them
+            if quality_score >= 0.3 or level_name == 'level_4_maximum':
+                print(f"✅ Sufficient results found at {level_config['description']}")
+                return results
+            
+            print(f"⚠️ Insufficient results, escalating to next level...")
         
-        total_time = time.time() - start_time
-        print(f"💾 Cached multi-search results for future queries (total: {total_time:.3f}s)")
-        print(f"📊 Performance breakdown: Search={search_time:.3f}s, Combine={combine_time:.3f}s, Rerank={rerank_time:.3f}s")
+        # Fallback - return best available results
+        return results if 'results' in locals() else []
+
+    def _broaden_queries(self, queries: List[str], broadening_factor: int) -> List[str]:
+        """Intelligently broaden queries based on broadening factor"""
+        if broadening_factor == 0:
+            return queries  # No broadening - exact search
         
-        return final_results
-    
+        broadened = []
+        for query in queries:
+            broadened.append(query)  # Always include original
+            
+            if broadening_factor >= 1:
+                # Level 1: Remove question words and specificity
+                simplified = self._simplify_query(query)
+                if simplified != query:
+                    broadened.append(simplified)
+            
+            if broadening_factor >= 2:
+                # Level 2: Extract core concepts
+                core_concepts = self._extract_core_concepts(query)
+                broadened.extend(core_concepts)
+            
+            if broadening_factor >= 3:
+                # Level 3: Maximum generalization - extract main topic
+                main_topic = self._extract_main_topic(query)
+                if main_topic:
+                    broadened.append(main_topic)
+        
+        # Remove duplicates while preserving order
+        unique_queries = []
+        seen = set()
+        for q in broadened:
+            if q.lower() not in seen:
+                seen.add(q.lower())
+                unique_queries.append(q)
+        
+        print(f"   🔄 Broadened {len(queries)} queries to {len(unique_queries)} queries")
+        return unique_queries
+
+    def _simplify_query(self, query: str) -> str:
+        """Remove question words and make query more searchable"""
+        # Remove common question patterns
+        simplified = query.lower()
+        
+        # Remove question words
+        question_words = ['var mı', 'nedir', 'kimdir', 'nelerdir', 'hangi', 'nasıl', 'ne zaman', 'nerede']
+        for qw in question_words:
+            simplified = simplified.replace(qw, '').strip()
+        
+        # Remove question marks and clean up
+        simplified = simplified.replace('?', '').strip()
+        
+        # If too short, return original
+        if len(simplified.split()) < 2:
+            return query
+            
+        return simplified
+
+    def _extract_core_concepts(self, query: str) -> List[str]:
+        """Extract core concepts from query for broader search"""
+        query_lower = query.lower()
+        concepts = []
+        
+        # Core concept mappings
+        concept_mappings = {
+            'sporcu': ['burs', 'sporcu', 'atletik'],
+            'burs': ['burs türleri', 'finansal destek', 'öğrenci yardımı'],
+            'sınav': ['değerlendirme', 'ölçme', 'test'],
+            'kayıt': ['öğrenci işleri', 'akademik kayıt', 'kayıt işlemleri'],
+            'yurt': ['barınma', 'konaklama', 'öğrenci yurdu'],
+            'ders': ['akademik program', 'müfredat', 'eğitim']
+        }
+        
+        for key, related_concepts in concept_mappings.items():
+            if key in query_lower:
+                concepts.extend(related_concepts)
+        
+        return concepts[:3]  # Limit to prevent over-broadening
+
+    def _extract_main_topic(self, query: str) -> str:
+        """Extract the main topic for maximum generalization"""
+        query_lower = query.lower()
+        
+        # Main topic extraction
+        if any(word in query_lower for word in ['sporcu', 'burs']):
+            return 'burs'
+        elif any(word in query_lower for word in ['sınav', 'değerlendirme']):
+            return 'sınav'
+        elif any(word in query_lower for word in ['ders', 'müfredat']):
+            return 'ders'
+        elif any(word in query_lower for word in ['kayıt', 'işlem']):
+            return 'kayıt'
+        elif any(word in query_lower for word in ['yurt', 'barınma']):
+            return 'yurt'
+        elif any(word in query_lower for word in ['rektör', 'yönetim']):
+            return 'yönetim'
+        
+        return None
+
     async def _perform_single_hybrid_search(self, question: str, query_vector: Optional[np.ndarray], 
                                           collection) -> List[Dict]:
         """Perform enhanced hybrid search with query expansion for better coverage"""
@@ -297,7 +323,7 @@ class SearchEngine:
         
         # Step 4: Enhanced result combination with expansion boost
         combined_results = self._combine_search_results_with_expansion(
-            combined_semantic, all_keyword_results, len(expanded_queries) - 1
+            combined_semantic, all_keyword_results, len(expanded_queries) - 1, question
         )
         
         # Cache results
@@ -389,8 +415,8 @@ class SearchEngine:
             print(f"⚠️ ChromaDB keyword search error: {e}")
             return {'documents': [[]], 'metadatas': [[]]}
     
-    def _combine_search_results(self, semantic_results: Dict, keyword_results: Dict) -> List[Dict]:
-        """Combine semantic and keyword search results"""
+    def _combine_search_results(self, semantic_results: Dict, keyword_results: Dict, query: str = "") -> List[Dict]:
+        """Combine semantic and keyword search results with semantic boosting"""
         combined, seen_docs = [], set()
         
         # Add semantic results first (higher priority)
@@ -404,6 +430,10 @@ class SearchEngine:
                     if self._contains_biographical_info(doc):
                         score *= 1.4  # 40% boost for biographical content
                         print(f"   📊 Applied biographical boost to semantic result (score: {score:.3f})")
+                    
+                    # Apply semantic boosting for critical keywords
+                    if query:
+                        score = self._apply_semantic_boosting(doc, query, score)
                     
                     combined.append({
                         'document': doc,
@@ -425,6 +455,10 @@ class SearchEngine:
                         score *= 1.4  # 40% boost for biographical content
                         print(f"   📊 Applied biographical boost to keyword result (score: {score:.3f})")
                     
+                    # Apply semantic boosting for critical keywords
+                    if query:
+                        score = self._apply_semantic_boosting(doc, query, score)
+                    
                     combined.append({
                         'document': doc,
                         'metadata': keyword_results['metadatas'][0][i],
@@ -436,6 +470,86 @@ class SearchEngine:
         # Sort by score
         combined.sort(key=lambda x: x['score'], reverse=True)
         return combined
+
+    def _apply_semantic_boosting(self, doc: str, query: str, base_score: float) -> float:
+        """Advanced semantic boosting for critical keyword matches"""
+        doc_lower = doc.lower()
+        query_lower = query.lower()
+        boosted_score = base_score
+        
+        # Critical time/day keywords - MASSIVE boost for exact matches
+        time_keywords = {
+            'cumartesi': 2.5,      # Saturday - critical for exam scheduling
+            'pazar': 2.5,          # Sunday 
+            'hafta sonu': 2.0,     # Weekend
+            'tatil günü': 2.0,     # Holiday
+            'resmi tatil': 1.8,    # Official holiday
+            'pazartesi': 1.3,      # Monday
+            'salı': 1.3,           # Tuesday  
+            'çarşamba': 1.3,       # Wednesday
+            'perşembe': 1.3,       # Thursday
+            'cuma': 1.3,           # Friday
+        }
+        
+        # Critical procedure keywords - Strong boost
+        procedure_keywords = {
+            'zorunlu hallerde': 2.2,  # In mandatory cases
+            'olağandışı durumlarda': 2.0,  # In extraordinary circumstances
+            'rektörlük onayı': 1.8,   # Rectorship approval
+            'yönetim kurulu': 1.6,    # Management board
+            'senato kararı': 1.6,     # Senate decision
+            'madde': 1.4,             # Article (legal reference)
+        }
+        
+        # Subject-specific keywords - Moderate boost
+        subject_keywords = {
+            'sınav': 1.5,             # Exam
+            'final': 1.4,             # Final exam
+            'ara sınav': 1.4,         # Midterm
+            'bütünleme': 1.4,         # Make-up exam
+            'değerlendirme': 1.3,     # Assessment
+            'ölçme': 1.3,             # Measurement
+        }
+        
+        # Apply time keyword boosting
+        for keyword, boost_factor in time_keywords.items():
+            if keyword in query_lower and keyword in doc_lower:
+                boosted_score *= boost_factor
+                print(f"   🚀 CRITICAL TIME BOOST: '{keyword}' found - score boosted by {boost_factor}x")
+        
+        # Apply procedure keyword boosting  
+        for keyword, boost_factor in procedure_keywords.items():
+            if keyword in query_lower and keyword in doc_lower:
+                boosted_score *= boost_factor
+                print(f"   📋 PROCEDURE BOOST: '{keyword}' found - score boosted by {boost_factor}x")
+        
+        # Apply subject keyword boosting
+        for keyword, boost_factor in subject_keywords.items():
+            if keyword in query_lower and keyword in doc_lower:
+                boosted_score *= boost_factor
+                print(f"   📚 SUBJECT BOOST: '{keyword}' found - score boosted by {boost_factor}x")
+        
+        # Compound keyword boosting - Extra boost for multiple critical terms
+        critical_matches = 0
+        all_keywords = {**time_keywords, **procedure_keywords, **subject_keywords}
+        
+        for keyword in all_keywords.keys():
+            if keyword in query_lower and keyword in doc_lower:
+                critical_matches += 1
+                
+        if critical_matches >= 2:
+            compound_boost = 1.0 + (critical_matches * 0.2)  # 20% per additional match
+            boosted_score *= compound_boost
+            print(f"   ⚡ COMPOUND BOOST: {critical_matches} matches - additional {compound_boost}x boost")
+        
+        # Exact phrase matching - Highest priority
+        query_phrases = [phrase.strip() for phrase in query_lower.split(',') if len(phrase.strip()) > 3]
+        for phrase in query_phrases:
+            if phrase in doc_lower and len(phrase) > 5:
+                boosted_score *= 1.8
+                print(f"   🎯 EXACT PHRASE BOOST: '{phrase}' found - score boosted by 1.8x")
+        
+        return min(boosted_score, 3.0)  # Cap at 3.0 to prevent over-boosting
     
     def _contains_biographical_info(self, doc: str) -> bool:
         """Check if document contains biographical information rather than procedural references"""
@@ -557,7 +671,7 @@ class SearchEngine:
         return results[:15] 
 
     def _combine_search_results_with_expansion(self, semantic_results: Dict, keyword_results: Dict, 
-                                             expansion_count: int) -> List[Dict]:
+                                             expansion_count: int, query: str = "") -> List[Dict]:
         """Enhanced result combination that boosts scores for expansion matches"""
         combined, seen_docs = [], set()
         
@@ -572,6 +686,10 @@ class SearchEngine:
                     if self._contains_biographical_info(doc):
                         score *= 1.4  # 40% boost for biographical content
                         print(f"   📊 Applied biographical boost to semantic result (score: {score:.3f})")
+                    
+                    # Apply semantic boosting for critical keywords
+                    if query:
+                        score = self._apply_semantic_boosting(doc, query, score)
                     
                     combined.append({
                         'document': doc,
@@ -601,6 +719,10 @@ class SearchEngine:
                         final_score *= 1.4  # 40% boost for biographical content
                         print(f"   📊 Applied biographical boost to keyword result (score: {final_score:.3f})")
                     
+                    # Apply semantic boosting for critical keywords
+                    if query:
+                        final_score = self._apply_semantic_boosting(doc, query, final_score)
+                    
                     combined.append({
                         'document': doc,
                         'metadata': keyword_results['metadatas'][0][i],
@@ -616,3 +738,87 @@ class SearchEngine:
             print(f"   🎯 Applied expansion boost to {len([r for r in combined if 'expanded' in r['source']])} results")
         
         return combined 
+
+    async def _execute_search_level(self, queries: List[str], query_vectors: List[np.ndarray], 
+                                   collection, level_config: Dict, use_reranking: bool) -> List[Dict]:
+        """Execute search at specific level with configured weights"""
+        
+        # Adjust number of queries based on level
+        max_queries = min(len(queries), 6 - level_config['broadening_factor'])
+        selected_queries = queries[:max_queries]
+        
+        print(f"   🔍 Searching with {len(selected_queries)} queries")
+        
+        # Execute multi-search (reuse existing logic)
+        all_results = []
+        for i, query in enumerate(selected_queries):
+            query_vector = query_vectors[i] if i < len(query_vectors) else None
+            results = await self._perform_single_hybrid_search(query, query_vector, collection)
+            all_results.extend(results)
+        
+        # Remove duplicates and apply level-specific scoring
+        unique_results = self._deduplicate_and_score(all_results, level_config)
+        
+        # Apply re-ranking if requested
+        if use_reranking and len(unique_results) > 5:
+            unique_results = await self._intelligent_rerank(selected_queries[0], unique_results)
+        
+        return unique_results[:15]
+
+    def _evaluate_search_quality(self, results: List[Dict], original_query: str) -> float:
+        """Evaluate the quality of search results"""
+        if not results:
+            return 0.0
+        
+        # Basic quality metrics
+        total_score = 0.0
+        
+        # 1. Number of results (more is better, up to a point)
+        count_score = min(len(results) / 10, 1.0) * 0.3
+        
+        # 2. Average relevance score
+        if results:
+            avg_score = sum(r.get('score', 0) for r in results) / len(results)
+            relevance_score = avg_score * 0.5
+        else:
+            relevance_score = 0.0
+        
+        # 3. Keyword coverage in top results
+        query_words = set(original_query.lower().split())
+        top_results = results[:5]
+        keyword_matches = 0
+        
+        for result in top_results:
+            doc_words = set(result.get('document', '').lower().split())
+            if query_words.intersection(doc_words):
+                keyword_matches += 1
+        
+        coverage_score = (keyword_matches / len(top_results)) * 0.2 if top_results else 0.0
+        
+        total_score = count_score + relevance_score + coverage_score
+        return min(total_score, 1.0)
+
+    def _deduplicate_and_score(self, results: List[Dict], level_config: Dict) -> List[Dict]:
+        """Remove duplicates and apply level-specific scoring adjustments"""
+        seen_docs = set()
+        unique_results = []
+        
+        for result in results:
+            doc_key = result.get('document', '')[:100]
+            if doc_key not in seen_docs and doc_key.strip():
+                # Adjust score based on level configuration
+                adjusted_score = result.get('score', 0)
+                
+                # Apply semantic/keyword weight adjustments
+                if result.get('source') == 'semantic':
+                    adjusted_score *= level_config['semantic_weight']
+                else:
+                    adjusted_score *= level_config['keyword_weight']
+                
+                result['score'] = adjusted_score
+                unique_results.append(result)
+                seen_docs.add(doc_key)
+        
+        # Sort by adjusted score
+        unique_results.sort(key=lambda x: x.get('score', 0), reverse=True)
+        return unique_results 
