@@ -137,33 +137,85 @@ class SearchEngine:
                                  collection, use_reranking: bool = True) -> List[Dict]:
         """Enhanced multi-search with progressive widening fallback"""
         
-        print(f"🔍 Executing progressive multi-search for {len(queries)} queries")
+        print(f"\n" + "="*80)
+        print(f"🚀 PROGRESSIVE SEARCH ENGINE ACTIVATED!")
+        print(f"🔍 Starting for {len(queries)} queries")
+        print(f"📋 Queries: {[q[:40]+'...' for q in queries]}")
+        print(f"🎯 Search levels configured: {list(self.search_levels.keys())}")
+        print(f"="*80)
         
-        # Try progressive search levels until we get sufficient results
-        for level_name, level_config in self.search_levels.items():
-            print(f"🎯 Trying {level_config['description']} (Level: {level_name})")
+        try:
+            # Try progressive search levels until we get sufficient results
+            for level_name, level_config in self.search_levels.items():
+                print(f"🎯 LEVEL {level_name}: {level_config['description']}")
+                
+                try:
+                    # Adjust queries based on broadening factor
+                    adjusted_queries = self._broaden_queries(queries, level_config['broadening_factor'])
+                    
+                    # Execute search with level-specific weights
+                    results = await self._execute_search_level(
+                        adjusted_queries, query_vectors, collection, level_config, use_reranking
+                    )
+                    
+                    # Evaluate result quality
+                    quality_score = self._evaluate_search_quality(results, queries[0])
+                    print(f"   📊 Quality score: {quality_score:.2f} (Results: {len(results)})")
+                    
+                    # If we have sufficient quality results, return them
+                    if quality_score >= 0.3 or level_name == 'level_4_maximum':
+                        print(f"✅ SUCCESS: Found sufficient results at {level_config['description']}")
+                        return results
+                    
+                    print(f"⚠️ Quality insufficient, escalating to next level...")
+                    
+                except Exception as e:
+                    print(f"❌ Level {level_name} failed: {e}")
+                    continue
             
-            # Adjust queries based on broadening factor
-            adjusted_queries = self._broaden_queries(queries, level_config['broadening_factor'])
+            # If we get here, all levels failed
+            print(f"❌ PROGRESSIVE SEARCH FAILED: All levels exhausted")
+            return results if 'results' in locals() else []
             
-            # Execute search with level-specific weights
-            results = await self._execute_search_level(
-                adjusted_queries, query_vectors, collection, level_config, use_reranking
-            )
+        except Exception as e:
+            print(f"❌ PROGRESSIVE SEARCH EXCEPTION: {e}")
+            print(f"🔄 Falling back to legacy multi-search...")
             
-            # Evaluate result quality
-            quality_score = self._evaluate_search_quality(results, queries[0])
-            print(f"   📊 Quality score: {quality_score:.2f}")
-            
-            # If we have sufficient quality results, return them
-            if quality_score >= 0.3 or level_name == 'level_4_maximum':
-                print(f"✅ Sufficient results found at {level_config['description']}")
-                return results
-            
-            print(f"⚠️ Insufficient results, escalating to next level...")
+            # Emergency fallback to old system
+            return await self._legacy_multi_search(queries, query_vectors, collection, use_reranking)
+
+    async def _legacy_multi_search(self, queries: List[str], query_vectors: List[np.ndarray], 
+                                 collection, use_reranking: bool) -> List[Dict]:
+        """Legacy multi-search implementation as emergency fallback"""
+        print(f"🔄 LEGACY FALLBACK: Executing basic multi-search for {len(queries)} queries")
         
-        # Fallback - return best available results
-        return results if 'results' in locals() else []
+        try:
+            # Execute all searches in parallel (old method)
+            search_tasks = []
+            for i, query in enumerate(queries):
+                query_vector = query_vectors[i] if i < len(query_vectors) else None
+                task = self._perform_single_hybrid_search(query, query_vector, collection)
+                search_tasks.append(task)
+            
+            # Wait for all searches to complete
+            all_results = await asyncio.gather(*search_tasks)
+            
+            # Combine results using old method
+            combined_results = self._combine_multi_search_results(all_results)
+            
+            # Apply basic re-ranking if needed
+            if use_reranking and self.cross_encoder_model and len(combined_results) > 5:
+                try:
+                    combined_results = await self._intelligent_rerank(queries[0], combined_results)
+                except Exception as e:
+                    print(f"   ⚠️ Legacy re-ranking failed: {e}")
+            
+            print(f"✅ LEGACY FALLBACK: Returned {len(combined_results)} results")
+            return combined_results[:15]
+            
+        except Exception as e:
+            print(f"❌ LEGACY FALLBACK FAILED: {e}")
+            return []  # Ultimate fallback - empty results
 
     def _broaden_queries(self, queries: List[str], broadening_factor: int) -> List[str]:
         """Intelligently broaden queries based on broadening factor"""
@@ -747,21 +799,34 @@ class SearchEngine:
         max_queries = min(len(queries), 6 - level_config['broadening_factor'])
         selected_queries = queries[:max_queries]
         
-        print(f"   🔍 Searching with {len(selected_queries)} queries")
+        print(f"   🔍 Level search with {len(selected_queries)} queries: {[q[:30]+'...' for q in selected_queries]}")
         
-        # Execute multi-search (reuse existing logic)
+        # Execute searches for this level
         all_results = []
         for i, query in enumerate(selected_queries):
             query_vector = query_vectors[i] if i < len(query_vectors) else None
+            
+            # Use existing single search but with level-specific adjustments
             results = await self._perform_single_hybrid_search(query, query_vector, collection)
+            
+            # Apply level-specific scoring immediately
+            for result in results:
+                if result.get('source') == 'semantic':
+                    result['score'] *= level_config['semantic_weight']
+                else:
+                    result['score'] *= level_config['keyword_weight']
+            
             all_results.extend(results)
         
-        # Remove duplicates and apply level-specific scoring
+        # Remove duplicates and sort by score
         unique_results = self._deduplicate_and_score(all_results, level_config)
         
-        # Apply re-ranking if requested
-        if use_reranking and len(unique_results) > 5:
-            unique_results = await self._intelligent_rerank(selected_queries[0], unique_results)
+        # Apply re-ranking if requested and beneficial
+        if use_reranking and self.cross_encoder_model and len(unique_results) > 5:
+            try:
+                unique_results = await self._intelligent_rerank(selected_queries[0], unique_results)
+            except Exception as e:
+                print(f"   ⚠️ Re-ranking failed at level search: {e}")
         
         return unique_results[:15]
 

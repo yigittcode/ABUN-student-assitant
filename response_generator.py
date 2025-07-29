@@ -65,8 +65,8 @@ class ResponseGenerator:
             response = await self.openai_client.chat.completions.create(
                 model=LLM_MODEL,
                 messages=[{"role": "user", "content": enhanced_prompt}],
-                temperature=0.1,
-                max_tokens=1000
+                temperature=0.2,
+                max_tokens=500  # Concise responses - max 2-3 paragraphs
             )
             
             result = response.choices[0].message.content.strip()
@@ -140,8 +140,8 @@ class ResponseGenerator:
             stream = await self.openai_client.chat.completions.create(
                 model=LLM_MODEL,
                 messages=[{"role": "user", "content": enhanced_prompt}],
-                temperature=0.1,
-                max_tokens=1000,
+                temperature=0.2,
+                max_tokens=500,  # Concise responses - max 2-3 paragraphs
                 stream=True
             )
             

@@ -22,6 +22,10 @@ class SemanticEmbeddingEngine:
     def __init__(self, embedding_model):
         self.embedding_model = embedding_model
         
+        # E5-Large model optimization
+        self.model_name = str(embedding_model).lower()
+        self.use_e5_prefixes = 'e5' in self.model_name or 'multilingual-e5' in self.model_name
+        
         # Content type detection patterns
         self.content_patterns = {
             'legal_article': [
@@ -77,12 +81,19 @@ class SemanticEmbeddingEngine:
         # Return the type with highest score
         return max(type_scores.items(), key=lambda x: x[1])[0]
     
-    def enhance_text_for_embedding(self, text: str, content_type: str = None) -> str:
-        """Enhance text for better semantic embedding"""
+    def enhance_text_for_embedding(self, text: str, content_type: str = None, is_query: bool = True) -> str:
+        """Enhance text for better semantic embedding with E5-large optimization"""
         if not content_type:
             content_type = self.detect_content_type(text)
         
         enhanced_text = text
+        
+        # E5-Large model specific prefixes for SOTA performance
+        if self.use_e5_prefixes:
+            if is_query:
+                enhanced_text = f"query: {enhanced_text}"
+            else:
+                enhanced_text = f"passage: {enhanced_text}"
         
         # Content-type specific enhancement
         if content_type == 'legal_article':
@@ -239,8 +250,8 @@ class SemanticEmbeddingEngine:
             structure_type = doc.get('structure_type', 'general')
             hierarchy_level = doc.get('hierarchy_level', 1)
             
-            # Create enhanced content
-            enhanced_content = self.enhance_text_for_embedding(content, content_type)
+            # Create enhanced content with passage prefix for E5-large
+            enhanced_content = self.enhance_text_for_embedding(content, content_type, is_query=False)
             
             # Add structural context
             if structure_type == 'article':
